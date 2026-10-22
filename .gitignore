@@ -1,0 +1,6 @@
+   vector_db/
+   models/
+   __pycache__/
+   *.pdf
+   .DS_Store
+   

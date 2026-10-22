@@ -1,0 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+sentence-transformers
+chromadb
+pypdf
+requests
+streamlit
+groq
