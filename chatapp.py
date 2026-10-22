@@ -55,7 +55,7 @@ def get_groq_key():
     except Exception:
         return os.getenv("GROQ_API_KEY")       # local, if you set it
 
-GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_MODEL = "openai/gpt-oss-20b"
 
 def stream_answer(question: str, chunks: list[dict]):
     user_message = f"<sources>\n{format_sources(chunks)}\n</sources>\n\nQuestion: {question}"
@@ -67,7 +67,10 @@ def stream_answer(question: str, chunks: list[dict]):
         from groq import Groq
         stream = Groq(api_key=key).chat.completions.create(
             model=GROQ_MODEL, messages=messages,
-            temperature=0.1, max_tokens=400, stream=True)
+            temperature=0.1,
+            max_tokens=1024,            # was 400
+            reasoning_effort="low",     # new
+            stream=True)
         for part in stream:
             yield part.choices[0].delta.content or ""
         return
