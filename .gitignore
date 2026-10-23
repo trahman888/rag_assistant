@@ -3,5 +3,6 @@
    __pycache__/
    *.pdf
    .DS_Store
+   user_data/
    .streamlit/secrets.toml
    
