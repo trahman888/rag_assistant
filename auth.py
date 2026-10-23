@@ -22,13 +22,16 @@ ADMIN SAFETY
 
 STAYING LOGGED IN AFTER A PAGE REFRESH
     A refresh starts a brand-new Streamlit session, and st.session_state starts
-    empty. So after login we save a token in a browser cookie ("pa_session"),
-    and on the next page load restore_login() reads it back:
-      * Supabase mode: the cookie holds the Supabase refresh token. We exchange
-        it for a fresh session (Supabase also hands back a new refresh token,
+    empty. So after login we save a token in the browser's localStorage (key
+    "pa_session"), using a tiny invisible component (_browser_token) whose
+    JavaScript reads and writes it and reports it back to Python. On the next
+    page load restore_login() uses it:
+      * Supabase mode: the token is the Supabase refresh token. We exchange it
+        for a fresh session (Supabase also hands back a new refresh token,
         which we save, so the old one stops working).
-      * Local mode: the cookie holds a signed, expiring token.
-    Log out deletes the cookie. Tokens last REMEMBER_DAYS.
+      * Local mode: a signed token that expires after REMEMBER_DAYS.
+    Log out deletes it. (Cookies are not used: Streamlit Community Cloud
+    doesn't pass custom cookies through to the app.)
 """
 import base64
 import hashlib
@@ -162,31 +165,53 @@ def _read_local_token(token: str) -> dict | None:
 
 
 def _remember(token: str) -> None:
-    st.session_state["_cookie_write"] = token        # written to the browser on the next run
+    st.session_state["_store_write"] = token          # saved in the browser on the next run
 
 
-def _cookie_script(value: str, max_age: int) -> None:
-    secure = "; Secure" if str(st.context.url or "").startswith("https") else ""
-    st.html(f"<script>document.cookie = '{COOKIE}={value}; path=/; max-age={max_age}; SameSite=Lax{secure}';</script>",
-            unsafe_allow_javascript=True)
+# A tiny invisible component whose JavaScript runs in the user's browser. It saves
+# or deletes the token in the browser's localStorage when Python asks it to, and
+# always reports the currently saved token back to Python. This avoids cookies,
+# which Streamlit Community Cloud doesn't pass through to the app.
+_BRIDGE_JS = """
+export default function(component) {
+    const { data, setStateValue } = component;
+    const KEY = "%s";
+    try {
+        if (data && data.clear) localStorage.removeItem(KEY);
+        if (data && data.write) localStorage.setItem(KEY, data.write);
+    } catch (e) {}
+    let saved = "";
+    try { saved = localStorage.getItem(KEY) || ""; } catch (e) {}
+    setStateValue("token", saved);
+}
+""" % COOKIE
+
+_bridge = None
+_BRIDGE_KEY = "pa_session_bridge"
 
 
-def sync_cookie() -> None:
-    """Call once per run, early. Writes or deletes the browser cookie when needed."""
-    token = st.session_state.pop("_cookie_write", None)
-    if token:
-        _cookie_script(token, REMEMBER_DAYS * 86400)
-    if st.session_state.pop("_cookie_clear", False):
-        _cookie_script("", 0)
+def _saved_token() -> str | None:
+    """What the browser last reported: the saved token, "" if none, or None if
+    the browser hasn't answered yet (the first moment after a page load)."""
+    state = st.session_state.get(_BRIDGE_KEY) or {}
+    try:
+        return state.get("token")
+    except AttributeError:
+        return getattr(state, "token", None)
 
 
-def restore_login() -> None:
-    """After a refresh: log the person back in from their cookie, if it's still valid."""
-    if "user" in st.session_state or st.session_state.get("_logged_out"):
-        return
-    token = (st.context.cookies or {}).get(COOKIE, "")
-    if not token:
-        return
+def _mount_bridge() -> None:
+    """Draw the invisible bridge (once per run). Any pending save/delete is sent with it."""
+    global _bridge
+    if _bridge is None:
+        _bridge = st.components.v2.component(_BRIDGE_KEY, js=_BRIDGE_JS)
+    data = {"write": st.session_state.pop("_store_write", None),
+            "clear": st.session_state.pop("_store_clear", False)}
+    _bridge(key=_BRIDGE_KEY, data=data, on_token_change=lambda: None, height=0)
+
+
+def restore_login(token: str) -> None:
+    """After a refresh: log the person back in from their saved token, if it's still valid."""
     user = None
     if token.startswith("sb.") and supabase_enabled():
         try:
@@ -201,19 +226,41 @@ def restore_login() -> None:
     if user:
         st.session_state["user"] = user
     else:
-        st.session_state["_cookie_clear"] = True                 # expired or invalid: forget it
+        st.session_state["_store_clear"] = True                  # expired or invalid: forget it
+        st.session_state["_restore_failed"] = True
 
 
 def _logged_in(user: dict) -> None:
     st.session_state["user"] = user
     st.session_state.pop("_logged_out", None)
+    st.session_state.pop("_restore_failed", None)
     if not supabase_enabled():                 # Supabase mode already saved its refresh token
         _remember(_local_token(user))
 
 
 # --------------------------------------------------------------------------- public
-def current_user() -> dict | None:
-    restore_login()
+CHECKING = "checking"     # returned by current_user() while the browser hasn't answered yet
+
+
+def current_user():
+    """The logged-in user (dict), None if nobody is logged in, or CHECKING on the
+    first moment after a page load while we ask the browser for a saved login."""
+    result = _who_is_logged_in()
+    _mount_bridge()           # after the check, so a renewed token is saved in this same run
+    return result
+
+
+def _who_is_logged_in():
+    if "user" in st.session_state:
+        return st.session_state["user"]
+    if st.session_state.get("_logged_out") or st.session_state.get("_restore_failed"):
+        return None
+    token = _saved_token()
+    if token is None:                                # browser hasn't answered yet
+        st.session_state["_waits"] = st.session_state.get("_waits", 0) + 1
+        return CHECKING if st.session_state["_waits"] <= 2 else None
+    if token:
+        restore_login(token)
     return st.session_state.get("user")
 
 
@@ -225,8 +272,8 @@ def log_out() -> None:
             pass
     for key in list(st.session_state.keys()):   # forget everything about this user
         del st.session_state[key]
-    st.session_state["_logged_out"] = True      # don't auto-restore from the old cookie in this tab
-    st.session_state["_cookie_clear"] = True    # delete the cookie on the next run
+    st.session_state["_logged_out"] = True      # don't auto-restore the old login in this tab
+    st.session_state["_store_clear"] = True     # delete the saved login on the next run
 
 
 def _valid(email: str, password: str) -> str | None:
