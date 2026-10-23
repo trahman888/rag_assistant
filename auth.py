@@ -19,17 +19,33 @@ ADMIN SAFETY
     exists before anyone else can sign up with that address: create it first,
     and keep Supabase "Confirm email" ON so nobody can claim an email they
     don't own.
+
+STAYING LOGGED IN AFTER A PAGE REFRESH
+    A refresh starts a brand-new Streamlit session, and st.session_state starts
+    empty. So after login we save a token in a browser cookie ("pa_session"),
+    and on the next page load restore_login() reads it back:
+      * Supabase mode: the cookie holds the Supabase refresh token. We exchange
+        it for a fresh session (Supabase also hands back a new refresh token,
+        which we save, so the old one stops working).
+      * Local mode: the cookie holds a signed, expiring token.
+    Log out deletes the cookie. Tokens last REMEMBER_DAYS.
 """
+import base64
 import hashlib
+import hmac
 import json
 import os
 import re
 import secrets
+import time
 from pathlib import Path
 
 import streamlit as st
 
 USERS_FILE = Path(__file__).parent / "user_data" / "users.json"
+SECRET_FILE = Path(__file__).parent / "user_data" / ".session_secret"
+COOKIE = "pa_session"
+REMEMBER_DAYS = 14
 
 
 # --------------------------------------------------------------------------- config
@@ -103,16 +119,101 @@ def _supabase_sign_up(email: str, password: str) -> dict | None:
     res = supabase_client().auth.sign_up({"email": email, "password": password})
     if res.session is None:   # project requires email confirmation
         return None
+    _remember("sb." + res.session.refresh_token)
     return {"id": res.user.id, "email": res.user.email}
 
 
 def _supabase_log_in(email: str, password: str) -> dict:
     res = supabase_client().auth.sign_in_with_password({"email": email, "password": password})
+    _remember("sb." + res.session.refresh_token)
     return {"id": res.user.id, "email": res.user.email}
+
+
+# --------------------------------------------------------------------------- "remember me" cookie
+def _server_secret() -> bytes:
+    """Key for signing local-mode tokens (secret SESSION_SECRET, else a random file)."""
+    s = _secret("SESSION_SECRET")
+    if s:
+        return s.encode()
+    if not SECRET_FILE.exists():
+        SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SECRET_FILE.write_text(secrets.token_hex(32))
+    return SECRET_FILE.read_text().encode()
+
+
+def _local_token(user: dict) -> str:
+    payload = base64.urlsafe_b64encode(json.dumps(
+        {"id": user["id"], "email": user["email"], "exp": int(time.time()) + REMEMBER_DAYS * 86400}
+    ).encode()).decode().rstrip("=")
+    sig = hmac.new(_server_secret(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"lo.{payload}.{sig}"
+
+
+def _read_local_token(token: str) -> dict | None:
+    try:
+        _, payload, sig = token.split(".")
+        good = hmac.new(_server_secret(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, good):
+            return None
+        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return {"id": data["id"], "email": data["email"]} if data["exp"] > time.time() else None
+    except Exception:
+        return None
+
+
+def _remember(token: str) -> None:
+    st.session_state["_cookie_write"] = token        # written to the browser on the next run
+
+
+def _cookie_script(value: str, max_age: int) -> None:
+    secure = "; Secure" if str(st.context.url or "").startswith("https") else ""
+    st.html(f"<script>document.cookie = '{COOKIE}={value}; path=/; max-age={max_age}; SameSite=Lax{secure}';</script>",
+            unsafe_allow_javascript=True)
+
+
+def sync_cookie() -> None:
+    """Call once per run, early. Writes or deletes the browser cookie when needed."""
+    token = st.session_state.pop("_cookie_write", None)
+    if token:
+        _cookie_script(token, REMEMBER_DAYS * 86400)
+    if st.session_state.pop("_cookie_clear", False):
+        _cookie_script("", 0)
+
+
+def restore_login() -> None:
+    """After a refresh: log the person back in from their cookie, if it's still valid."""
+    if "user" in st.session_state or st.session_state.get("_logged_out"):
+        return
+    token = (st.context.cookies or {}).get(COOKIE, "")
+    if not token:
+        return
+    user = None
+    if token.startswith("sb.") and supabase_enabled():
+        try:
+            res = supabase_client().auth.refresh_session(token[3:])
+            if res.session and res.user:
+                user = {"id": res.user.id, "email": res.user.email}
+                _remember("sb." + res.session.refresh_token)     # Supabase rotated it; save the new one
+        except Exception:
+            user = None
+    elif token.startswith("lo.") and not supabase_enabled():
+        user = _read_local_token(token)
+    if user:
+        st.session_state["user"] = user
+    else:
+        st.session_state["_cookie_clear"] = True                 # expired or invalid: forget it
+
+
+def _logged_in(user: dict) -> None:
+    st.session_state["user"] = user
+    st.session_state.pop("_logged_out", None)
+    if not supabase_enabled():                 # Supabase mode already saved its refresh token
+        _remember(_local_token(user))
 
 
 # --------------------------------------------------------------------------- public
 def current_user() -> dict | None:
+    restore_login()
     return st.session_state.get("user")
 
 
@@ -124,6 +225,8 @@ def log_out() -> None:
             pass
     for key in list(st.session_state.keys()):   # forget everything about this user
         del st.session_state[key]
+    st.session_state["_logged_out"] = True      # don't auto-restore from the old cookie in this tab
+    st.session_state["_cookie_clear"] = True    # delete the cookie on the next run
 
 
 def _valid(email: str, password: str) -> str | None:
@@ -152,7 +255,7 @@ def login_page(app_name: str, tagline: str) -> None:
             if st.form_submit_button("Log in", type="primary", use_container_width=True):
                 try:
                     user = (_supabase_log_in if supabase_enabled() else _local_log_in)(email, password)
-                    st.session_state["user"] = user
+                    _logged_in(user)
                     st.rerun()
                 except Exception as e:
                     st.error(_friendly(e))
@@ -171,7 +274,7 @@ def login_page(app_name: str, tagline: str) -> None:
                         if user is None:
                             st.success("Account created. Check your email to confirm it, then log in.")
                         else:
-                            st.session_state["user"] = user
+                            _logged_in(user)
                             st.rerun()
                     except Exception as e:
                         st.error(_friendly(e))

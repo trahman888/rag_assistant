@@ -28,7 +28,8 @@ import requests
 import streamlit as st
 
 from answer import LLM_MODEL, OLLAMA_URL, SYSTEM_PROMPT, find_citations
-from auth import current_user, is_admin, log_out, login_page, supabase_client, supabase_enabled
+from auth import (current_user, is_admin, log_out, login_page, supabase_client, supabase_enabled,
+                  sync_cookie)
 from knowledge_base import (LocalFiles, SupabaseFiles, add_document, delete_document, ensure_synced,
                             list_documents, read_attachment, search, shared_collection)
 
@@ -44,7 +45,8 @@ st.set_page_config(page_title=APP_NAME, page_icon="🔎", layout="centered")
 
 
 # =========================================================================== 1. login gate
-user = current_user()
+user = current_user()            # also restores the login from the browser cookie after a refresh
+sync_cookie()                    # save / delete that cookie when needed
 if not user:
     login_page(APP_NAME, TAGLINE)
     st.stop()
