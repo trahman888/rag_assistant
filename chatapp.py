@@ -132,7 +132,10 @@ with st.sidebar:
                 with st.spinner(f"Saving and indexing {f.name}…"):
                     try:
                         added = add_document(files, collection, folder, f.name, f.getvalue())
-                        st.success(f"{f.name}: {added} chunks") if added else st.info(f"{f.name}: already in your library")
+                        if added:
+                            st.success(f"{f.name}: {added} chunks")
+                        else:
+                            st.info(f"{f.name}: already in your library")
                     except Exception as e:
                         st.error(f"{f.name}: {e}")
 
