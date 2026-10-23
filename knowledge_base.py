@@ -48,14 +48,18 @@ def safe_name(name: str) -> str:
 
 # =========================================================================== shared vector db
 _client = None
+_client_lock = threading.Lock()
 
 
 def shared_collection():
+    """Open the vector database once per server. The lock stops two visitors who
+    arrive at the same moment from opening it twice at once (which Chroma rejects)."""
     global _client
-    if _client is None:
-        _client = chromadb.PersistentClient(path=str(DB_DIR))
-    return _client.get_or_create_collection(
-        "shared_kb", metadata={"hnsw:space": "cosine"}, embedding_function=None)
+    with _client_lock:
+        if _client is None:
+            _client = chromadb.PersistentClient(path=str(DB_DIR))
+        return _client.get_or_create_collection(
+            "shared_kb", metadata={"hnsw:space": "cosine"}, embedding_function=None)
 
 
 def list_documents(collection) -> list[dict]:
