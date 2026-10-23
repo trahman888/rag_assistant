@@ -29,6 +29,7 @@ import streamlit as st
 
 from answer import LLM_MODEL, OLLAMA_URL, SYSTEM_PROMPT, find_citations
 from auth import current_user, is_admin, log_out, login_page, supabase_client, supabase_enabled
+from router import CHAT, chat_system_prompt, route
 from knowledge_base import (LocalFiles, SupabaseFiles, add_document, delete_document, ensure_synced,
                             list_documents, read_attachment, search, shared_collection)
 
@@ -89,21 +90,14 @@ def sources_for_llm(chunks: list[dict]) -> str:
     return "\n\n".join(blocks)
 
 
-def stream_answer(question: str, chunks: list[dict]):
-    note = ""
-    if any(c.get("attached") for c in chunks):
-        note = ("The user attached their own file(s), marked '(file attached by the user)'. "
-                "When the question refers to 'my file', 'this PDF', 'the document' or similar, "
-                "answer from those sources.\n\n")
-    user_message = f"{note}<sources>\n{sources_for_llm(chunks)}\n</sources>\n\nQuestion: {question}"
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_message}]
-
+def llm_stream(messages: list[dict], max_tokens: int = 1024, temperature: float = 0.1):
+    """Send messages to the LLM and yield the reply piece by piece."""
     key = _secret("GROQ_API_KEY")
     if key:                                                   # online: Groq
         from groq import Groq
         stream = Groq(api_key=key).chat.completions.create(
-            model=GROQ_MODEL, messages=messages, temperature=0.1,
-            max_tokens=1024, reasoning_effort="low", stream=True)
+            model=GROQ_MODEL, messages=messages, temperature=temperature,
+            max_tokens=max_tokens, reasoning_effort="low", stream=True)
         for part in stream:
             yield part.choices[0].delta.content or ""
         return
@@ -111,7 +105,7 @@ def stream_answer(question: str, chunks: list[dict]):
     with requests.post(                                       # local: Ollama
         f"{OLLAMA_URL}/api/chat",
         json={"model": LLM_MODEL, "messages": messages, "stream": True, "think": False,
-              "options": {"temperature": 0.1, "num_ctx": 4096, "num_predict": 400}},
+              "options": {"temperature": temperature, "num_ctx": 4096, "num_predict": min(max_tokens, 400)}},
         stream=True, timeout=(10, 120),
     ) as r:
         if r.status_code == 404:
@@ -123,6 +117,30 @@ def stream_answer(question: str, chunks: list[dict]):
                 yield piece.get("message", {}).get("content", "")
                 if piece.get("done"):
                     break
+
+
+def llm_complete(messages: list[dict]) -> str:
+    """Same LLM, whole reply at once (used by the router)."""
+    return "".join(llm_stream(messages, max_tokens=300, temperature=0.0)).strip()
+
+
+def stream_answer(question: str, chunks: list[dict]):
+    """RAG answer: question + numbered sources -> cited answer."""
+    note = ""
+    if any(c.get("attached") for c in chunks):
+        note = ("The user attached their own file(s), marked '(file attached by the user)'. "
+                "When the question refers to 'my file', 'this PDF', 'the document' or similar, "
+                "answer from those sources.\n\n")
+    user_message = f"{note}<sources>\n{sources_for_llm(chunks)}\n</sources>\n\nQuestion: {question}"
+    return llm_stream([{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_message}])
+
+
+def stream_chat_reply(question: str, history: list[dict], doc_names: list[str]):
+    """Small-talk reply: no documents, a little recent conversation for context."""
+    system = chat_system_prompt(APP_NAME, doc_names, st.session_state["attached_names"])
+    recent = [{"role": m["role"], "content": m["content"]} for m in history[-6:]]
+    return llm_stream([{"role": "system", "content": system}, *recent,
+                       {"role": "user", "content": question}], max_tokens=300, temperature=0.5)
 
 
 def show_sources(sources: list[dict], cited: list[int]) -> None:
@@ -253,17 +271,25 @@ if submission:
             st.markdown(text)
         else:
             try:
-                with st.spinner("Searching…"):
-                    chunks = search(collection, st.session_state["attachments"], question, TOP_K)
-                if not chunks:
-                    text = "There's nothing to search yet: the knowledge base is empty and no files are attached."
-                    st.markdown(text)
-                else:
-                    text = st.write_stream(stream_answer(question, chunks)).strip()
-                    cited, invalid = find_citations(text, len(chunks))
-                    if invalid:
-                        st.warning(f"The answer mentions sources that don't exist: {invalid}")
-                    show_sources(chunks, cited)
+                # ---- 4b. decide first: small talk, or a question for the documents?
+                with st.spinner("Thinking…"):
+                    kind = route(question, bool(st.session_state["attachments"]), llm_complete)
+
+                if kind == CHAT:                           # small talk: no search, no sources
+                    text = st.write_stream(stream_chat_reply(question, messages[:-1],
+                                                             [d["source"] for d in docs])).strip()
+                else:                                      # ---- 4c. search + cited answer
+                    with st.spinner("Searching…"):
+                        chunks = search(collection, st.session_state["attachments"], question, TOP_K)
+                    if not chunks:
+                        text = "There's nothing to search yet: the knowledge base is empty and no files are attached."
+                        st.markdown(text)
+                    else:
+                        text = st.write_stream(stream_answer(question, chunks)).strip()
+                        cited, invalid = find_citations(text, len(chunks))
+                        if invalid:
+                            st.warning(f"The answer mentions sources that don't exist: {invalid}")
+                        show_sources(chunks, cited)
             except requests.ConnectionError:
                 text = "⚠️ Can't reach the language model right now. Please try again shortly."
                 st.error(text)
