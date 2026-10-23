@@ -1,25 +1,25 @@
 """
-Multi-user RAG chat app — login first, then each user gets their own documents.
+RAG chat app — admin-managed knowledge base, chat for everyone.
 
 RUN
     streamlit run chatapp.py
 
-FLOW
-    1. Not logged in  -> login / sign-up page (auth.py). Nothing else is shown.
-    2. Logged in      -> sync_user() restores that user's files and index
-                         (user_store.py), then the chat appears.
-    3. Upload         -> saved permanently (Supabase Storage, or the local
-                         folder in local mode) + indexed into the user's own
-                         vector collection.
-    4. Ask            -> search ONLY that user's collection -> LLM -> cited answer.
-    5. Log out        -> session cleared; the next person starts at step 1.
+WHO SEES WHAT
+    Not logged in   -> login / sign-up page only.
+    Normal user     -> chat only (no sidebar). Answers come from the shared
+                       knowledge base. They can attach files in the chat box
+                       for extra context; those files are used for THIS chat
+                       only and are never saved.
+    Admin           -> the same chat + a sidebar to upload / delete / reload
+                       the shared knowledge base. Admin emails: ADMIN_EMAILS
+                       secret, default in auth.py.
 
 LLM
-    GROQ_API_KEY set (Streamlit secrets or env)  -> Groq (open-source gpt-oss)
-    otherwise                                    -> local Ollama (answer.py settings)
+    GROQ_API_KEY set  -> Groq (open-source gpt-oss)
+    otherwise         -> local Ollama (answer.py settings)
 
 FILES THIS NEEDS
-    auth.py, user_store.py, answer.py, vector_store.py (+ the files vector_store imports)
+    auth.py, knowledge_base.py, answer.py, vector_store.py (+ files it imports)
 """
 import json
 import os
@@ -28,13 +28,17 @@ import requests
 import streamlit as st
 
 from answer import LLM_MODEL, OLLAMA_URL, SYSTEM_PROMPT, find_citations, format_sources
-from auth import current_user, log_out, login_page, supabase_client, supabase_enabled
-from user_store import (LocalFiles, SupabaseFiles, add_document, delete_document, list_documents,
-                        search, sync_user, user_collection, user_folder)
+from auth import current_user, is_admin, log_out, login_page, supabase_client, supabase_enabled
+from knowledge_base import (LocalFiles, SupabaseFiles, add_document, delete_document, ensure_synced,
+                            list_documents, read_attachment, search, shared_collection)
 
 APP_NAME = "Groundwork"          # change to your app's name
-TAGLINE = "Ask questions across your documents and get answers grounded in sources."
+TAGLINE = "Ask questions across the knowledge base and get answers grounded in sources."
 GROQ_MODEL = "openai/gpt-oss-20b"
+TOP_K = 4                        # sources per answer
+ATTACH_MODE = "multiple"         # "multiple" = pick files, "directory" = pick a whole folder
+MAX_ATTACHED_FILES = 10          # per chat, to keep memory use small
+MAX_FILE_MB = 20
 
 st.set_page_config(page_title=APP_NAME, page_icon="🔎", layout="centered")
 
@@ -43,23 +47,27 @@ st.set_page_config(page_title=APP_NAME, page_icon="🔎", layout="centered")
 user = current_user()
 if not user:
     login_page(APP_NAME, TAGLINE)
-    st.stop()                    # nothing below runs until someone is logged in
+    st.stop()
+
+admin = is_admin(user)
+files = SupabaseFiles(supabase_client()) if supabase_enabled() else LocalFiles()
+collection = shared_collection()
+
+try:
+    with st.spinner("Preparing the knowledge base…"):
+        ensure_synced(files, collection)        # no-op unless the server just restarted
+except Exception as e:
+    st.error(f"Couldn't load the knowledge base: {e}")
+
+st.session_state.setdefault("messages", [])
+st.session_state.setdefault("attachments", [])     # chunks of files attached in this chat
+st.session_state.setdefault("attached_names", [])
 
 
-# =========================================================================== 2. this user's data
-folder = user_folder(user)
-collection = user_collection(user)
-files = SupabaseFiles(supabase_client(), user) if supabase_enabled() else LocalFiles(folder)
-
-if not st.session_state.get("synced"):
-    with st.spinner("Loading your documents…"):
-        try:
-            report = sync_user(files, collection, folder)
-            if report["indexed"]:
-                st.toast(f"Restored {report['indexed']} document(s)")
-        except Exception as e:
-            st.error(f"Couldn't load your documents: {e}")
-    st.session_state["synced"] = True
+def new_chat():
+    st.session_state["messages"] = []
+    st.session_state["attachments"] = []
+    st.session_state["attached_names"] = []
 
 
 # =========================================================================== LLM
@@ -101,74 +109,90 @@ def stream_answer(question: str, chunks: list[dict]):
                     break
 
 
-def llm_label() -> str:
-    return f"`{GROQ_MODEL}` (Groq)" if _secret("GROQ_API_KEY") else f"`{LLM_MODEL}` (Ollama)"
-
-
 def show_sources(sources: list[dict], cited: list[int]) -> None:
     if not sources:
         return
     with st.expander(f"📄 Sources ({len(cited)} cited of {len(sources)})"):
         for n, c in enumerate(sources, start=1):
             page = f", page {c['page']}" if c.get("page") else ""
-            st.markdown(f"**[{n}] {c['source']}{page}** — {'✅ cited' if n in cited else 'not cited'}")
+            where = " · 📎 your attachment" if c.get("attached") else ""
+            st.markdown(f"**[{n}] {c['source']}{page}**{where} — {'✅ cited' if n in cited else 'not cited'}")
             st.caption(c["text"][:600] + ("…" if len(c["text"]) > 600 else ""))
 
 
-# =========================================================================== 3. sidebar
-with st.sidebar:
-    st.markdown(f"👤 **{user['email']}**")
-    if st.button("Log out", use_container_width=True):
-        log_out()
-        st.rerun()
-    st.divider()
+# =========================================================================== 2. admin sidebar
+docs = list_documents(collection)
 
-    st.header("📁 My documents")
-    with st.form("upload", clear_on_submit=True):
-        uploads = st.file_uploader("Add PDF, Markdown or text files", type=["pdf", "md", "txt"],
-                                   accept_multiple_files=True)
-        if st.form_submit_button("Add to my library", type="primary", use_container_width=True) and uploads:
-            for f in uploads:
-                with st.spinner(f"Saving and indexing {f.name}…"):
-                    try:
-                        added = add_document(files, collection, folder, f.name, f.getvalue())
-                        if added:
-                            st.success(f"{f.name}: {added} chunks")
-                        else:
-                            st.info(f"{f.name}: already in your library")
-                    except Exception as e:
-                        st.error(f"{f.name}: {e}")
+if admin:                         # normal users never call st.sidebar, so they don't get one
+    with st.sidebar:
+        st.header("🛠️ Knowledge base")
+        st.caption("Admin only. Files added here are saved permanently and used for everyone's answers.")
 
-    docs = list_documents(collection)
-    st.caption(f"{len(docs)} document(s) · {collection.count()} chunks")
-    for d in docs:
-        left, right = st.columns([5, 1])
-        left.markdown(f"**{d['source']}**  \n{d['chunks']} chunks")
-        if right.button("🗑️", key=f"del-{d['doc_id']}", help=f"Delete {d['source']}"):
-            delete_document(files, collection, folder, d["source"])
+        with st.form("upload", clear_on_submit=True):
+            uploads = st.file_uploader("Add PDF, Markdown or text files", type=["pdf", "md", "txt"],
+                                       accept_multiple_files=True)
+            if st.form_submit_button("Add to knowledge base", type="primary", use_container_width=True) and uploads:
+                for f in uploads:
+                    with st.spinner(f"Saving and indexing {f.name}…"):
+                        try:
+                            added = add_document(files, collection, f.name, f.getvalue())
+                            if added:
+                                st.success(f"{f.name}: {added} chunks")
+                            else:
+                                st.info(f"{f.name}: already in the knowledge base")
+                        except Exception as e:
+                            st.error(f"{f.name}: {e}")
+                docs = list_documents(collection)
+
+        st.caption(f"{len(docs)} document(s) · {collection.count()} chunks")
+        for d in docs:
+            left, right = st.columns([5, 1])
+            left.markdown(f"**{d['source']}**  \n{d['chunks']} chunks")
+            if right.button("🗑️", key=f"del-{d['doc_id']}", help=f"Delete {d['source']}"):
+                delete_document(files, collection, d["source"])
+                st.rerun()
+
+        if st.button("🔄 Reload from storage", use_container_width=True):
+            ensure_synced(files, collection, force=True)
             st.rerun()
 
-    if st.button("🔄 Reload my documents", use_container_width=True):
-        st.session_state["synced"] = False
-        st.rerun()
+        st.divider()
+        llm = f"`{GROQ_MODEL}` (Groq)" if _secret("GROQ_API_KEY") else f"`{LLM_MODEL}` (Ollama)"
+        st.caption(f"LLM: {llm}")
 
-    st.divider()
-    k = st.slider("Sources per answer", 1, 8, 4)
-    st.caption(f"LLM: {llm_label()}")
-    if st.button("🧹 Clear chat", use_container_width=True):
-        st.session_state["messages"] = []
+
+# =========================================================================== 3. header
+title_col, user_col = st.columns([3, 2], vertical_alignment="center")
+title_col.title(f"🔎 {APP_NAME}")
+with user_col:
+    st.caption(f"👤 {user['email']}" + (" · **admin**" if admin else ""))
+    b1, b2 = st.columns(2)
+    if b1.button("New chat", use_container_width=True):
+        new_chat()
+        st.rerun()
+    if b2.button("Log out", use_container_width=True):
+        log_out()
+        st.rerun()
+st.caption(TAGLINE)
+
+if st.session_state["attached_names"]:
+    a, b = st.columns([4, 1], vertical_alignment="center")
+    a.caption("📎 In this chat only, not saved: " + ", ".join(st.session_state["attached_names"]))
+    if b.button("Remove", help="Forget the attached files"):
+        st.session_state["attachments"], st.session_state["attached_names"] = [], []
         st.rerun()
 
 
 # =========================================================================== 4. chat
-st.title(f"🔎 {APP_NAME}")
-st.caption(TAGLINE)
-
-messages = st.session_state.setdefault("messages", [])
+messages = st.session_state["messages"]
 if not messages:
     with st.chat_message("assistant"):
-        st.markdown(f"Hi! You have **{len(docs)}** document(s). What would you like to know?" if docs
-                    else "Hi! Upload some documents in the sidebar, then ask me anything about them.")
+        if docs:
+            st.markdown(f"Hi! I can answer questions from **{len(docs)}** document(s) in the knowledge base. "
+                        "You can also attach your own files with 📎 for this chat.")
+        else:
+            st.markdown("Hi! The knowledge base is empty right now. "
+                        + ("Add documents in the sidebar." if admin else "You can attach your own files with 📎 and ask about them."))
 
 for msg in messages:
     with st.chat_message(msg["role"]):
@@ -176,26 +200,64 @@ for msg in messages:
         if msg["role"] == "assistant":
             show_sources(msg.get("sources", []), msg.get("cited", []))
 
-question = st.chat_input("Ask about your documents…", disabled=not docs)
-if question:
-    messages.append({"role": "user", "content": question})
+submission = st.chat_input("Ask a question, or attach files with 📎…", accept_file=ATTACH_MODE,
+                           file_type=["pdf", "md", "txt"], max_upload_size=MAX_FILE_MB)
+
+if submission:
+    question = (submission.text or "").strip()
+    new_files = submission.files or []
+
+    # ---- 4a. read any attached files (memory only)
+    read_ok, problems = [], []
+    for f in new_files:
+        if len(st.session_state["attached_names"]) >= MAX_ATTACHED_FILES:
+            problems.append(f"Only {MAX_ATTACHED_FILES} files per chat — skipped {f.name}")
+            continue
+        try:
+            with st.spinner(f"Reading {f.name}…"):
+                chunks = read_attachment(f.name, f.getvalue())
+            st.session_state["attachments"] += chunks
+            st.session_state["attached_names"].append(chunks[0]["source"])
+            read_ok.append(chunks[0]["source"])
+        except Exception as e:
+            problems.append(str(e))
+
+    user_text = question or "*(attached files)*"
+    if new_files:
+        user_text += "\n\n📎 " + ", ".join(f.name for f in new_files)
+    messages.append({"role": "user", "content": user_text})
     with st.chat_message("user"):
-        st.markdown(question)
+        st.markdown(user_text)
 
     with st.chat_message("assistant"):
+        for p in problems:
+            st.warning(p)
         chunks, cited = [], []
-        try:
-            with st.spinner("Searching your documents…"):
-                chunks = search(collection, question, k)
-            text = st.write_stream(stream_answer(question, chunks)).strip()
-            cited, invalid = find_citations(text, len(chunks))
-            if invalid:
-                st.warning(f"The answer mentions sources that don't exist: {invalid}")
-            show_sources(chunks, cited)
-        except requests.ConnectionError:
-            text = "⚠️ Can't reach Ollama. Start it with `ollama serve`, or add GROQ_API_KEY."
-            st.error(text)
-        except Exception as e:
-            text = f"⚠️ Something went wrong: {e}"
-            st.error(text)
+
+        if not question:                                   # files only, no question yet
+            text = (f"I've read **{', '.join(read_ok)}** for this chat. What would you like to know?"
+                    if read_ok else "I couldn't read those files.")
+            st.markdown(text)
+        else:
+            try:
+                with st.spinner("Searching…"):
+                    chunks = search(collection, st.session_state["attachments"], question, TOP_K)
+                if not chunks:
+                    text = "There's nothing to search yet: the knowledge base is empty and no files are attached."
+                    st.markdown(text)
+                else:
+                    text = st.write_stream(stream_answer(question, chunks)).strip()
+                    cited, invalid = find_citations(text, len(chunks))
+                    if invalid:
+                        st.warning(f"The answer mentions sources that don't exist: {invalid}")
+                    show_sources(chunks, cited)
+            except requests.ConnectionError:
+                text = "⚠️ Can't reach the language model right now. Please try again shortly."
+                st.error(text)
+            except Exception as e:
+                text = f"⚠️ Something went wrong: {e}"
+                st.error(text)
+
     messages.append({"role": "assistant", "content": text, "sources": chunks, "cited": cited})
+    if read_ok:
+        st.rerun()                # redraw so the "📎 In this chat only" banner appears right away
