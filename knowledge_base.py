@@ -183,22 +183,46 @@ def read_attachment(name: str, data: bytes) -> list[dict]:
 
 
 # =========================================================================== search
+ATTACH_WHOLE_LIMIT = 8     # attachments this small (in chunks) are sent to the LLM in full
+ATTACH_TOP = 6             # otherwise: this many best-matching attachment chunks
+KB_WITH_ATTACH = 2         # knowledge-base chunks allowed alongside attachments
+
+
 def search(collection, attachments: list[dict], question: str, k: int = 4) -> list[dict]:
-    """Search the shared knowledge base AND this chat's attachments, best matches first."""
+    """Find the passages to answer from.
+
+    No attachments  -> the k best knowledge-base chunks.
+    Attachments     -> the user's own files come FIRST, like in ChatGPT:
+                       * a small attachment is included in full, so questions
+                         like "summarise my PDF" work even though they match no
+                         particular passage;
+                       * a large one contributes its best-matching chunks;
+                       * up to KB_WITH_ATTACH knowledge-base chunks are added
+                         only if they match the question better than the
+                         attachment does, so the knowledge base can't crowd out
+                         the user's file.
+    """
     q = np.array(embed([question])[0], dtype=np.float32)
-    hits = []
 
-    n = collection.count()
-    if n:
-        r = collection.query(query_embeddings=[q.tolist()], n_results=min(k, n))
-        hits += [{"text": t, "source": m["source"], "page": m.get("page") or None, "score": 1 - d, "attached": False}
-                 for t, m, d in zip(r["documents"][0], r["metadatas"][0], r["distances"][0])]
+    def kb_hits(n_wanted):
+        n = collection.count()
+        if not n or n_wanted <= 0:
+            return []
+        r = collection.query(query_embeddings=[q.tolist()], n_results=min(n_wanted, n))
+        return [{"text": t, "source": m["source"], "page": m.get("page") or None, "score": 1 - d, "attached": False}
+                for t, m, d in zip(r["documents"][0], r["metadatas"][0], r["distances"][0])]
 
-    if attachments:
-        scores = np.stack([a["vector"] for a in attachments]) @ q       # cosine (vectors are normalised)
-        for i in np.argsort(-scores)[:k]:
-            a = attachments[i]
-            hits.append({"text": a["text"], "source": a["source"], "page": a["page"],
-                         "score": float(scores[i]), "attached": True})
+    if not attachments:
+        return kb_hits(k)
 
-    return sorted(hits, key=lambda h: -h["score"])[:k]
+    scores = np.stack([a["vector"] for a in attachments]) @ q           # cosine (vectors are normalised)
+    if len(attachments) <= ATTACH_WHOLE_LIMIT:
+        chosen = range(len(attachments))                                # whole file(s), in reading order
+    else:
+        chosen = sorted(np.argsort(-scores)[:ATTACH_TOP])               # best chunks, kept in reading order
+    att = [{"text": attachments[i]["text"], "source": attachments[i]["source"], "page": attachments[i]["page"],
+            "score": float(scores[i]), "attached": True} for i in chosen]
+
+    best_att = max(h["score"] for h in att)
+    extra = [h for h in kb_hits(KB_WITH_ATTACH) if h["score"] > best_att]
+    return att + extra

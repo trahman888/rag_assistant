@@ -27,12 +27,12 @@ import os
 import requests
 import streamlit as st
 
-from answer import LLM_MODEL, OLLAMA_URL, SYSTEM_PROMPT, find_citations, format_sources
+from answer import LLM_MODEL, OLLAMA_URL, SYSTEM_PROMPT, find_citations
 from auth import current_user, is_admin, log_out, login_page, supabase_client, supabase_enabled
 from knowledge_base import (LocalFiles, SupabaseFiles, add_document, delete_document, ensure_synced,
                             list_documents, read_attachment, search, shared_collection)
 
-APP_NAME = "Groundwork"          # change to your app's name
+APP_NAME = "Knowledge Assistant"   # only used for the browser tab
 TAGLINE = "Ask questions across the knowledge base and get answers grounded in sources."
 GROQ_MODEL = "openai/gpt-oss-20b"
 TOP_K = 4                        # sources per answer
@@ -46,7 +46,7 @@ st.set_page_config(page_title=APP_NAME, page_icon="🔎", layout="centered")
 # =========================================================================== 1. login gate
 user = current_user()
 if not user:
-    login_page(APP_NAME, TAGLINE)
+    login_page("", TAGLINE)        # put a name in the quotes to show a title on the login page
     st.stop()
 
 admin = is_admin(user)
@@ -78,8 +78,24 @@ def _secret(name):
         return os.getenv(name)
 
 
+def sources_for_llm(chunks: list[dict]) -> str:
+    """Numbered sources; the user's own attachments are labelled so the LLM knows
+    which document "my file" / "this PDF" refers to."""
+    blocks = []
+    for n, c in enumerate(chunks, start=1):
+        page = f", page {c['page']}" if c.get("page") else ""
+        label = " (file attached by the user)" if c.get("attached") else " (knowledge base)"
+        blocks.append(f"[{n}] {c['source']}{page}{label}\n{c['text']}")
+    return "\n\n".join(blocks)
+
+
 def stream_answer(question: str, chunks: list[dict]):
-    user_message = f"<sources>\n{format_sources(chunks)}\n</sources>\n\nQuestion: {question}"
+    note = ""
+    if any(c.get("attached") for c in chunks):
+        note = ("The user attached their own file(s), marked '(file attached by the user)'. "
+                "When the question refers to 'my file', 'this PDF', 'the document' or similar, "
+                "answer from those sources.\n\n")
+    user_message = f"{note}<sources>\n{sources_for_llm(chunks)}\n</sources>\n\nQuestion: {question}"
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_message}]
 
     key = _secret("GROQ_API_KEY")
@@ -162,18 +178,14 @@ if admin:                         # normal users never call st.sidebar, so they 
 
 
 # =========================================================================== 3. header
-title_col, user_col = st.columns([3, 2], vertical_alignment="center")
-title_col.title(f"🔎 {APP_NAME}")
-with user_col:
-    st.caption(f"👤 {user['email']}" + (" · **admin**" if admin else ""))
-    b1, b2 = st.columns(2)
-    if b1.button("New chat", use_container_width=True):
-        new_chat()
-        st.rerun()
-    if b2.button("Log out", use_container_width=True):
-        log_out()
-        st.rerun()
-st.caption(TAGLINE)
+who_col, b1, b2 = st.columns([4, 1, 1], vertical_alignment="center")
+who_col.caption(f"👤 {user['email']}" + (" · **admin**" if admin else ""))
+if b1.button("New chat", use_container_width=True):
+    new_chat()
+    st.rerun()
+if b2.button("Log out", use_container_width=True):
+    log_out()
+    st.rerun()
 
 if st.session_state["attached_names"]:
     a, b = st.columns([4, 1], vertical_alignment="center")

@@ -136,7 +136,8 @@ def _valid(email: str, password: str) -> str | None:
 
 def login_page(app_name: str, tagline: str) -> None:
     """Draws the login / sign-up screen. Sets st.session_state['user'] on success."""
-    st.markdown(f"<h1 style='text-align:center'>🔎 {app_name}</h1>", unsafe_allow_html=True)
+    if app_name:
+        st.markdown(f"<h1 style='text-align:center'>🔎 {app_name}</h1>", unsafe_allow_html=True)
     st.markdown(f"<p style='text-align:center;opacity:.75'>{tagline}</p>", unsafe_allow_html=True)
     if not supabase_enabled():
         st.info("Local mode: accounts are stored on this computer only.", icon="💻")
