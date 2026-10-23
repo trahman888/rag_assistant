@@ -2,10 +2,3 @@
 2. download qwen model: ollama pull qwen3:4b
 3. next time if I want to see list of models in ollama: ollama list
 4. from code i can access using: LLM_MODEL = os.getenv("LLM_MODEL", "qwen3:4b")
-
-
-Steps
-
-1. Get a Groq key. Sign up at https://console.groq.com, go to API Keys, and create one. 
-
-api: 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
