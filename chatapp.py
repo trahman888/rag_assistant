@@ -28,8 +28,7 @@ import requests
 import streamlit as st
 
 from answer import LLM_MODEL, OLLAMA_URL, SYSTEM_PROMPT, find_citations
-from auth import (CHECKING, current_user, is_admin, log_out, login_page, supabase_client,
-                  supabase_enabled)
+from auth import current_user, is_admin, log_out, login_page, supabase_client, supabase_enabled
 from knowledge_base import (LocalFiles, SupabaseFiles, add_document, delete_document, ensure_synced,
                             list_documents, read_attachment, search, shared_collection)
 
@@ -45,12 +44,7 @@ st.set_page_config(page_title=APP_NAME, page_icon="🔎", layout="centered")
 
 
 # =========================================================================== 1. login gate
-user = current_user()            # also restores a saved login after a page refresh
-if user == CHECKING:             # first instant after a refresh: the browser is sending the saved login
-    st.caption("Checking your login…")
-    if st.button("Continue to login page"):
-        st.rerun()
-    st.stop()
+user = current_user()            # also restores the login after a page refresh
 if not user:
     login_page(APP_NAME, TAGLINE)
     st.stop()

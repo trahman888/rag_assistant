@@ -22,16 +22,19 @@ ADMIN SAFETY
 
 STAYING LOGGED IN AFTER A PAGE REFRESH
     A refresh starts a brand-new Streamlit session, and st.session_state starts
-    empty. So after login we save a token in the browser's localStorage (key
-    "pa_session"), using a tiny invisible component (_browser_token) whose
-    JavaScript reads and writes it and reports it back to Python. On the next
-    page load restore_login() uses it:
-      * Supabase mode: the token is the Supabase refresh token. We exchange it
-        for a fresh session (Supabase also hands back a new refresh token,
-        which we save, so the old one stops working).
+    empty. So after login we put a login token in the page address:
+        https://your-app.streamlit.app/?s=TOKEN
+    A refresh keeps the address, and Streamlit reads it on the server
+    (st.query_params), so this works on Streamlit Community Cloud, where
+    cookies and in-page JavaScript can't be relied on.
+      * Supabase mode: the token is the Supabase refresh token. Each page load
+        exchanges it for a fresh session and puts the NEW token in the address,
+        so an old copied address stops working.
       * Local mode: a signed token that expires after REMEMBER_DAYS.
-    Log out deletes it. (Cookies are not used: Streamlit Community Cloud
-    doesn't pass custom cookies through to the app.)
+    Log out removes it.
+
+    Because the address contains the login, don't share the page link while
+    logged in: share the plain app address instead.
 """
 import base64
 import hashlib
@@ -47,7 +50,7 @@ import streamlit as st
 
 USERS_FILE = Path(__file__).parent / "user_data" / "users.json"
 SECRET_FILE = Path(__file__).parent / "user_data" / ".session_secret"
-COOKIE = "pa_session"
+URL_PARAM = "s"                     # ?s=TOKEN in the page address
 REMEMBER_DAYS = 14
 
 
@@ -132,7 +135,7 @@ def _supabase_log_in(email: str, password: str) -> dict:
     return {"id": res.user.id, "email": res.user.email}
 
 
-# --------------------------------------------------------------------------- "remember me" cookie
+# --------------------------------------------------------------------------- "remember me" (page address)
 def _server_secret() -> bytes:
     """Key for signing local-mode tokens (secret SESSION_SECRET, else a random file)."""
     s = _secret("SESSION_SECRET")
@@ -165,49 +168,14 @@ def _read_local_token(token: str) -> dict | None:
 
 
 def _remember(token: str) -> None:
-    st.session_state["_store_write"] = token          # saved in the browser on the next run
+    """Put the login token in the page address (…/?s=TOKEN). Streamlit keeps it
+    through a refresh and reads it on the server, with no browser code needed."""
+    st.query_params[URL_PARAM] = token
 
 
-# A tiny invisible component whose JavaScript runs in the user's browser. It saves
-# or deletes the token in the browser's localStorage when Python asks it to, and
-# always reports the currently saved token back to Python. This avoids cookies,
-# which Streamlit Community Cloud doesn't pass through to the app.
-_BRIDGE_JS = """
-export default function(component) {
-    const { data, setStateValue } = component;
-    const KEY = "%s";
-    try {
-        if (data && data.clear) localStorage.removeItem(KEY);
-        if (data && data.write) localStorage.setItem(KEY, data.write);
-    } catch (e) {}
-    let saved = "";
-    try { saved = localStorage.getItem(KEY) || ""; } catch (e) {}
-    setStateValue("token", saved);
-}
-""" % COOKIE
-
-_bridge = None
-_BRIDGE_KEY = "pa_session_bridge"
-
-
-def _saved_token() -> str | None:
-    """What the browser last reported: the saved token, "" if none, or None if
-    the browser hasn't answered yet (the first moment after a page load)."""
-    state = st.session_state.get(_BRIDGE_KEY) or {}
-    try:
-        return state.get("token")
-    except AttributeError:
-        return getattr(state, "token", None)
-
-
-def _mount_bridge() -> None:
-    """Draw the invisible bridge (once per run). Any pending save/delete is sent with it."""
-    global _bridge
-    if _bridge is None:
-        _bridge = st.components.v2.component(_BRIDGE_KEY, js=_BRIDGE_JS)
-    data = {"write": st.session_state.pop("_store_write", None),
-            "clear": st.session_state.pop("_store_clear", False)}
-    _bridge(key=_BRIDGE_KEY, data=data, on_token_change=lambda: None, height=0)
+def _forget() -> None:
+    if URL_PARAM in st.query_params:
+        del st.query_params[URL_PARAM]
 
 
 def restore_login(token: str) -> None:
@@ -226,7 +194,7 @@ def restore_login(token: str) -> None:
     if user:
         st.session_state["user"] = user
     else:
-        st.session_state["_store_clear"] = True                  # expired or invalid: forget it
+        _forget()                                                # expired or invalid: drop it
         st.session_state["_restore_failed"] = True
 
 
@@ -239,26 +207,13 @@ def _logged_in(user: dict) -> None:
 
 
 # --------------------------------------------------------------------------- public
-CHECKING = "checking"     # returned by current_user() while the browser hasn't answered yet
-
-
-def current_user():
-    """The logged-in user (dict), None if nobody is logged in, or CHECKING on the
-    first moment after a page load while we ask the browser for a saved login."""
-    result = _who_is_logged_in()
-    _mount_bridge()           # after the check, so a renewed token is saved in this same run
-    return result
-
-
-def _who_is_logged_in():
+def current_user() -> dict | None:
+    """The logged-in user, restoring it from the page address after a refresh."""
     if "user" in st.session_state:
         return st.session_state["user"]
     if st.session_state.get("_logged_out") or st.session_state.get("_restore_failed"):
         return None
-    token = _saved_token()
-    if token is None:                                # browser hasn't answered yet
-        st.session_state["_waits"] = st.session_state.get("_waits", 0) + 1
-        return CHECKING if st.session_state["_waits"] <= 2 else None
+    token = st.query_params.get(URL_PARAM, "")
     if token:
         restore_login(token)
     return st.session_state.get("user")
@@ -273,7 +228,7 @@ def log_out() -> None:
     for key in list(st.session_state.keys()):   # forget everything about this user
         del st.session_state[key]
     st.session_state["_logged_out"] = True      # don't auto-restore the old login in this tab
-    st.session_state["_store_clear"] = True     # delete the saved login on the next run
+    _forget()                                   # remove the token from the page address
 
 
 def _valid(email: str, password: str) -> str | None:
