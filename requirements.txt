@@ -6,3 +6,4 @@ pypdf
 requests
 streamlit
 groq
+supabase
