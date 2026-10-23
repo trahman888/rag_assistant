@@ -32,7 +32,7 @@ from auth import current_user, is_admin, log_out, login_page, supabase_client, s
 from knowledge_base import (LocalFiles, SupabaseFiles, add_document, delete_document, ensure_synced,
                             list_documents, read_attachment, search, shared_collection)
 
-APP_NAME = "Knowledge Assistant"   # only used for the browser tab
+APP_NAME = "Personal Assistant"    # title on the login page, chat page and browser tab
 TAGLINE = "Ask questions across the knowledge base and get answers grounded in sources."
 GROQ_MODEL = "openai/gpt-oss-20b"
 TOP_K = 4                        # sources per answer
@@ -46,7 +46,7 @@ st.set_page_config(page_title=APP_NAME, page_icon="🔎", layout="centered")
 # =========================================================================== 1. login gate
 user = current_user()
 if not user:
-    login_page("", TAGLINE)        # put a name in the quotes to show a title on the login page
+    login_page(APP_NAME, TAGLINE)
     st.stop()
 
 admin = is_admin(user)
@@ -178,6 +178,7 @@ if admin:                         # normal users never call st.sidebar, so they 
 
 
 # =========================================================================== 3. header
+st.title(f"🔎 {APP_NAME}")
 who_col, b1, b2 = st.columns([4, 1, 1], vertical_alignment="center")
 who_col.caption(f"👤 {user['email']}" + (" · **admin**" if admin else ""))
 if b1.button("New chat", use_container_width=True):
