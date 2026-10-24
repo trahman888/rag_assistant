@@ -252,7 +252,8 @@ def show_figures(figures: list[dict]) -> None:
         picture = load_image(files, f["image"], SHARED_FOLDER)
         if picture:
             page = f", page {f['page']}" if f.get("page") else ""
-            st.image(picture, caption=f"🖼️ Figure from {f['source']}{page}", width=520)
+            label = f"{f['caption']} — " if f.get("caption") else "🖼️ Figure from "
+            st.image(picture, caption=f"{label}{f['source']}{page}", width=520)
 
 
 def show_sources(sources: list[dict], cited: list[int]) -> None:

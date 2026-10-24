@@ -249,7 +249,7 @@ def search(collection, attachments: list[dict], question: str, k: int = 4) -> li
             return []
         r = collection.query(query_embeddings=[q.tolist()], n_results=min(n_wanted, n))
         return [{"text": t, "source": m["source"], "page": m.get("page") or None, "score": 1 - d, "attached": False,
-                 "image": m.get("image")}
+                 "image": m.get("image"), "caption": m.get("caption", "")}
                 for t, m, d in zip(r["documents"][0], r["metadatas"][0], r["distances"][0])]
 
     if not attachments:
