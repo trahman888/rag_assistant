@@ -155,6 +155,23 @@ def show_sources(sources: list[dict], cited: list[int]) -> None:
             st.caption(c["text"][:600] + ("…" if len(c["text"]) > 600 else ""))
 
 
+# =========================================================================== delete confirmation
+@st.dialog("Delete document?", icon="⚠️")
+def confirm_delete(name: str, n_chunks: int) -> None:
+    """Pop-up shown before the admin deletes a knowledge-base document."""
+    st.markdown(f"**{name}** ({n_chunks} chunks)")
+    st.warning("This permanently removes the file from storage and from the knowledge base. "
+               "Nobody will get answers from it any more, and this can't be undone.")
+    cancel_col, delete_col = st.columns(2)
+    if cancel_col.button("Cancel", use_container_width=True):
+        st.rerun()
+    if delete_col.button("Delete", type="primary", use_container_width=True):
+        with st.spinner("Deleting…"):
+            delete_document(files, collection, name)
+        st.session_state["_deleted_note"] = name
+        st.rerun()
+
+
 # =========================================================================== 2. admin sidebar
 docs = list_documents(collection)
 
@@ -179,13 +196,15 @@ if admin:                         # normal users never call st.sidebar, so they 
                             st.error(f"{f.name}: {e}")
                 docs = list_documents(collection)
 
+        deleted = st.session_state.pop("_deleted_note", None)
+        if deleted:
+            st.success(f"Deleted {deleted}")
         st.caption(f"{len(docs)} document(s) · {collection.count()} chunks")
         for d in docs:
             left, right = st.columns([5, 1])
             left.markdown(f"**{d['source']}**  \n{d['chunks']} chunks")
             if right.button("🗑️", key=f"del-{d['doc_id']}", help=f"Delete {d['source']}"):
-                delete_document(files, collection, d["source"])
-                st.rerun()
+                confirm_delete(d["source"], d["chunks"])        # opens a "are you sure?" window
 
         if st.button("🔄 Reload from storage", use_container_width=True):
             ensure_synced(files, collection, force=True)
