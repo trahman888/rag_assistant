@@ -128,7 +128,8 @@ class LocalFiles:
 
 
 # =========================================================================== admin operations
-def add_document(files, collection, name: str, data: bytes, describe_fn=None, progress=None) -> tuple[int, int]:
+def add_document(files, collection, name: str, data: bytes, describe_fn=None, progress=None,
+                 on_error=None) -> tuple[int, int]:
     """Save + index one document. For PDFs, describe_fn (a vision model) also turns
     the PDF's images into searchable figure chunks. Returns (text_chunks, figures)."""
     from images import add_pdf_images, delete_pdf_images
@@ -145,7 +146,7 @@ def add_document(files, collection, name: str, data: bytes, describe_fn=None, pr
     chunks = index_file(path, collection)
     figures = 0
     if chunks and describe_fn and path.suffix.lower() == ".pdf":
-        figures = add_pdf_images(files, collection, path, file_id(path), name, describe_fn, progress)
+        figures = add_pdf_images(files, collection, path, file_id(path), name, describe_fn, progress, on_error)
     return chunks, figures
 
 
@@ -227,6 +228,26 @@ ATTACH_TOP = 6             # otherwise: this many best-matching attachment chunk
 KB_WITH_ATTACH = 2         # knowledge-base chunks allowed alongside attachments
 
 
+_FIGURE_REF = re.compile(r"\b(fig(?:ure)?s?\.?|tables?)\s*((?:\d+(?:\s*(?:,|and|&|or|-)\s*)?)+)", re.IGNORECASE)
+
+
+def named_figures(collection, question: str) -> list[dict]:
+    """Figures/tables the question names by number, matched on their captions."""
+    refs = {(("table" if kind.lower().startswith("tab") else "figure"), num)       # "figures 1 and 3" -> 1, 3
+            for kind, nums in _FIGURE_REF.findall(question or "") for num in re.findall(r"\d+", nums)}
+    if not refs:
+        return []
+    got = collection.get(where={"kind": "image"}, include=["documents", "metadatas"])
+    out = []
+    for text, m in zip(got["documents"], got["metadatas"]):
+        cap = (m.get("caption") or "").strip()
+        hit = re.match(r"(fig(?:ure)?\.?|table)\s*(\d+)", cap, re.IGNORECASE)
+        if hit and (("table" if hit.group(1).lower().startswith("tab") else "figure"), hit.group(2)) in refs:
+            out.append({"text": text, "source": m["source"], "page": m.get("page") or None, "score": 1.0,
+                        "attached": False, "image": m.get("image"), "caption": cap})
+    return out
+
+
 def search(collection, attachments: list[dict], question: str, k: int = 4) -> list[dict]:
     """Find the passages to answer from.
 
@@ -252,6 +273,13 @@ def search(collection, attachments: list[dict], question: str, k: int = 4) -> li
                  "image": m.get("image"), "caption": m.get("caption", "")}
                 for t, m, d in zip(r["documents"][0], r["metadatas"][0], r["distances"][0])]
 
+    # "show me figure 3" / "what's in Table 2?": semantic search is weak at numbers, so
+    # figures whose caption carries that number are looked up directly and always included.
+    named = named_figures(collection, question)
+    if named:
+        rest = [h for h in kb_hits(k + len(named)) if h.get("image") not in {n["image"] for n in named}]
+        if not attachments:
+            return (named + rest)[:max(k, len(named))]
     if not attachments:
         return kb_hits(k)
 
@@ -265,4 +293,4 @@ def search(collection, attachments: list[dict], question: str, k: int = 4) -> li
 
     best_att = max(h["score"] for h in att)
     extra = [h for h in kb_hits(KB_WITH_ATTACH) if h["score"] > best_att]
-    return att + extra
+    return att + named + [h for h in extra if h.get("image") not in {n["image"] for n in named}]

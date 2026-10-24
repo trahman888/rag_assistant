@@ -33,6 +33,8 @@ LIMITS
     cut imperfectly: two figures placed almost touching may merge into one, and
     a short line of body text right next to a figure may be included with it.
     Tune MERGE_GAP_PT / LABEL_GAP_PT above if your documents need it.
+    Tables drawn only with thin lines (most research-paper tables) are skipped:
+    their contents are already searchable as text. Boxed grid tables are kept.
     Scanned pages (one picture per page) are skipped here; they need OCR.
     Images are sent to the vision model as-is: text masking can't hide what's
     printed inside a picture.
@@ -49,7 +51,8 @@ MIN_SIDE_PT = 50        # points (1/72 inch): narrower or shorter regions are lo
 MIN_AREA_PT = 9_000     # points²: about 95 × 95
 FULL_PAGE = 0.80        # a region covering more than this share of the page is a whole page, not a figure
 MERGE_GAP_PT = 10       # pieces closer than this are one figure (tiles, panels, bars + axes)
-LABEL_GAP_PT = 14       # short text this close to a figure (axis labels, values) is part of it
+LABEL_GAP_PT = 14       # small text this close to a figure (axis labels, values) is part of it
+LABEL_FONT_RATIO = 0.8  # "small" = font under 80% of the page's body text (labels are small; paragraphs and captions aren't)
 RENDER_DPI = 150
 MAX_IMAGES = 20         # per document, to protect the vision model's free quota
 MAX_SEND_SIDE = 1024    # px: images are shrunk to this before being described
@@ -109,29 +112,39 @@ def figure_regions(page) -> list[tuple]:
     page_rect = page.rect
     boxes = [pymupdf.Rect(i["bbox"]) & page_rect for i in page.get_image_info()]   # placed pictures
     try:
-        boxes += [r & page_rect for r in page.cluster_drawings()]                # drawn charts, diagrams, tables
+        drawings = page.get_drawings()
+        for cluster in page.cluster_drawings(drawings=drawings):                 # drawn charts, diagrams
+            # (a perfectly flat line has zero height, which counts as "empty", so pad it before testing)
+            inside = [pymupdf.Rect(d["rect"]) for d in drawings
+                      if (pymupdf.Rect(d["rect"]) + (-1, -1, 1, 1)).intersects(cluster)]
+            if inside and all(min(r.width, r.height) < 2.5 for r in inside):
+                continue          # only thin rules: a text table or separator, already searchable as text
+            boxes.append(cluster & page_rect)
     except Exception:
         pass
     boxes = [b for b in boxes if not b.is_empty and b.width > 2 and b.height > 2]
     regions = _merge(boxes, MERGE_GAP_PT)
 
     lines = _text_lines(page)
+    body_size = _body_font_size(lines)
     results = []
     for r in regions:
         if r.get_area() > FULL_PAGE * page_rect.get_area():
             continue                                   # a whole-page picture (scan / slide), not a figure
         if min(r.width, r.height) < MIN_SIDE_PT or r.get_area() < MIN_AREA_PT:
             continue                                   # logo, icon, horizontal rule
-        caption = ""
-        for rect, text in lines:                       # pull in short labels around the figure
-            if _CAPTION.match(text):
-                continue
-            near = pymupdf.Rect(r.x0 - LABEL_GAP_PT, r.y0 - LABEL_GAP_PT, r.x1 + LABEL_GAP_PT, r.y1 + LABEL_GAP_PT)
-            if len(text) <= 40 and near.intersects(rect):
+        near = pymupdf.Rect(r.x0 - LABEL_GAP_PT, r.y0 - LABEL_GAP_PT, r.x1 + LABEL_GAP_PT, r.y1 + LABEL_GAP_PT)
+        for rect, text, size in lines:                 # pull in the figure's own small labels only,
+            if size < LABEL_FONT_RATIO * body_size and near.intersects(rect):   # never paragraphs or captions
                 r |= rect
-        caption = _find_caption(r, lines)
-        results.append((r + (-4, -4, 4, 4)) & page_rect)        # a little white margin
-        results[-1] = (results[-1], caption)
+        caption, cap_rect = _find_caption(r, lines)
+        crop = (r + (-4, -4, 4, 4)) & page_rect        # a little white margin
+        if cap_rect is not None:
+            if cap_rect.y0 > r.y0 + 0.6 * r.height:    # caption below: never include any of it
+                crop.y1 = min(crop.y1, cap_rect.y0 - 1)
+            elif cap_rect.y1 <= r.y0 + 2:              # caption above (tables): reach up to it, so the
+                crop.y0 = cap_rect.y1 + 1              # header row printed above the table's lines is kept
+        results.append((crop, caption))
     return sorted(results, key=lambda rc: (rc[0].y0, rc[0].x0))
 
 
@@ -160,30 +173,47 @@ def _merge(boxes: list, gap: float) -> list:
 
 
 def _text_lines(page) -> list[tuple]:
+    """(rectangle, text, font size) for every text line on the page."""
     import pymupdf
 
     out = []
     for block in page.get_text("dict")["blocks"]:
         for line in block.get("lines", []):
-            text = "".join(span["text"] for span in line["spans"]).strip()
-            if text:
-                out.append((pymupdf.Rect(line["bbox"]), text))
+            spans = [sp for sp in line["spans"] if sp["text"].strip()]
+            text = "".join(sp["text"] for sp in line["spans"]).strip()
+            if text and spans:
+                size = max(sp["size"] for sp in spans)
+                out.append((pymupdf.Rect(line["bbox"]), text, size))
     return out
 
 
-def _find_caption(region, lines) -> str:
-    """The 'Figure 3: …' / 'Table 1: …' line just below (or, for tables, just above) the region."""
-    best, best_dist = "", 60.0
-    for rect, text in lines:
+def _body_font_size(lines) -> float:
+    """The page's normal text size: the size used by the most characters."""
+    counts = {}
+    for _, text, size in lines:
+        counts[round(size, 1)] = counts.get(round(size, 1), 0) + len(text)
+    return max(counts, key=counts.get) if counts else 10.0
+
+
+def _find_caption(region, lines) -> tuple:
+    """The 'Figure 3: …' / 'Table 1: …' line belonging to the region: just below it
+    (even if the drawn area slightly overlaps it), or, for tables, just above it.
+    Returns (caption text, caption rectangle or None)."""
+    best, best_rect, best_dist = "", None, 60.0
+    for rect, text, _size in lines:
         if not _CAPTION.match(text):
             continue
-        overlaps = min(rect.x1, region.x1) - max(rect.x0, region.x0) > 0
-        if not overlaps:
+        if min(rect.x1, region.x1) - max(rect.x0, region.x0) <= 0:
+            continue                                   # not under/over the figure
+        if rect.y0 >= region.y1 - 25 and rect.y0 > region.y0 + 0.6 * region.height:
+            dist = max(0.0, rect.y0 - region.y1)       # below, or overlapping the bottom edge
+        elif rect.y1 <= region.y0 + 2:
+            dist = region.y0 - rect.y1 + 5             # above (table captions); slightly less preferred
+        else:
             continue
-        dist = rect.y0 - region.y1 if rect.y0 >= region.y1 - 2 else region.y0 - rect.y1
-        if 0 <= dist < best_dist:
-            best, best_dist = text, dist
-    return best[:200]
+        if dist < best_dist:
+            best, best_rect, best_dist = text, rect, dist
+    return best[:200], best_rect
 
 
 def _to_png(data: bytes) -> bytes:
@@ -202,7 +232,7 @@ def _to_png(data: bytes) -> bytes:
 
 # =========================================================================== 2–4. describe, store, index
 def add_pdf_images(files, collection, pdf_path: Path, doc_id: str, source: str,
-                   describe_fn, progress=None) -> int:
+                   describe_fn, progress=None, on_error=None) -> int:
     """Run the whole pipeline for one PDF. Returns how many figures were added.
     describe_fn(png_bytes, prompt) -> str ; progress(done, total) is optional."""
     images = extract_images(pdf_path)
@@ -216,6 +246,8 @@ def add_pdf_images(files, collection, pdf_path: Path, doc_id: str, source: str,
             text = (describe_fn(im["png"], prompt) or "").strip()
         except Exception as e:                      # one failed image shouldn't stop the upload
             print(f"[images] couldn't describe image {i} of {source}: {e}")
+            if on_error:
+                on_error(f"page {im['page']}: {e}")
             continue
         if not text or "DECORATIVE" in text.upper()[:40]:
             continue

@@ -309,15 +309,20 @@ if admin:                         # normal users never call st.sidebar, so they 
                     def progress(done, total, name=f.name, bar=bar):
                         bar.progress(done / total, text=f"{name}: describing image {done} of {total}…")
 
+                    image_errors = []
                     try:
                         added, figures = add_document(files, collection, f.name, f.getvalue(),
                                                       describe_fn=describe_image if read_images else None,
-                                                      progress=progress)
+                                                      progress=progress, on_error=image_errors.append)
                         bar.empty()
                         if added:
                             st.success(f"{f.name}: {added} chunks" + (f" + {figures} figures" if figures else ""))
+                            if image_errors:          # tell the admin instead of silently skipping
+                                st.warning(f"{len(image_errors)} image(s) couldn't be read by the vision model "
+                                           f"({vision_label()}). First error — {image_errors[0][:300]}")
                         else:
-                            st.info(f"{f.name}: already in the knowledge base")
+                            st.info(f"{f.name}: already in the knowledge base. To re-read its figures, "
+                                    "delete it with 🗑️ and upload it again.")
                     except Exception as e:
                         bar.empty()
                         st.error(f"{f.name}: {e}")
