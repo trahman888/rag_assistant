@@ -33,12 +33,15 @@ from auth import (current_user, display_name, is_admin, log_out, login_page, sup
 from privacy import PROMPT_NOTE as PRIVACY_NOTE
 from privacy import Masker
 from router import CHAT, chat_system_prompt, route
-from knowledge_base import (LocalFiles, SupabaseFiles, add_document, delete_document, ensure_synced,
-                            list_documents, read_attachment, search, shared_collection)
+from images import load_image
+from knowledge_base import (SHARED_FOLDER, LocalFiles, SupabaseFiles, add_document, delete_document,
+                            ensure_synced, list_documents, read_attachment, search, shared_collection)
 
 APP_NAME = "Personal Assistant"    # title on the login page, chat page and browser tab
 TAGLINE = "Ask questions across the knowledge base and get answers grounded in sources."
 GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_VISION_MODEL = "qwen/qwen3.8-27b"   # reads images (admin uploads only)
+LOCAL_VISION_MODEL = "qwen2.5vl:3b"      # Ollama vision model for local mode: ollama pull qwen2.5vl:3b
 TOP_K = 4                        # sources per answer
 ATTACH_MODE = "multiple"         # "multiple" = pick files, "directory" = pick a whole folder
 MAX_ATTACHED_FILES = 10          # per chat, to keep memory use small
@@ -158,6 +161,43 @@ def stream_chat_reply(question: str, history: list[dict], doc_names: list[str]):
                        {"role": "user", "content": question}], max_tokens=300, temperature=0.5)
 
 
+def vision_label() -> str:
+    return f"{GROQ_VISION_MODEL} on Groq" if _secret("GROQ_API_KEY") else f"{LOCAL_VISION_MODEL} on Ollama"
+
+
+def describe_image(png: bytes, prompt: str) -> str:
+    """Ask a vision model to describe one image (used when the admin uploads a PDF).
+    The prompt includes text from the PDF page, so it is privacy-masked like everything else."""
+    import base64
+    import re as _re
+
+    masker = Masker()
+    safe_prompt = masker.mask(prompt)
+    b64 = base64.b64encode(png).decode()
+
+    key = _secret("GROQ_API_KEY")
+    if key:                                                   # online: Groq vision model
+        from groq import Groq
+        resp = Groq(api_key=key).chat.completions.create(
+            model=GROQ_VISION_MODEL, temperature=0.1, max_tokens=1024,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": safe_prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            ]}])
+        text = resp.choices[0].message.content or ""
+    else:                                                     # local: Ollama vision model
+        r = requests.post(f"{OLLAMA_URL}/api/chat", timeout=(10, 300), json={
+            "model": LOCAL_VISION_MODEL, "stream": False, "think": False,
+            "messages": [{"role": "user", "content": safe_prompt, "images": [b64]}],
+            "options": {"temperature": 0.1, "num_ctx": 4096}})
+        if r.status_code == 404:
+            raise RuntimeError(f"Vision model '{LOCAL_VISION_MODEL}' not found. Run:  ollama pull {LOCAL_VISION_MODEL}")
+        r.raise_for_status()
+        text = r.json()["message"]["content"]
+    text = _re.sub(r"<think>.*?</think>", "", text, flags=_re.S).strip()   # drop any visible reasoning
+    return masker.unmask(text)
+
+
 def show_privacy_note(hidden: int) -> None:
     if hidden:
         st.caption(f"🔒 {hidden} private detail{'s' if hidden != 1 else ''} (emails, phone numbers…) "
@@ -170,8 +210,12 @@ def show_sources(sources: list[dict], cited: list[int]) -> None:
     with st.expander(f"📄 Sources ({len(cited)} cited of {len(sources)})"):
         for n, c in enumerate(sources, start=1):
             page = f", page {c['page']}" if c.get("page") else ""
-            where = " · 📎 your attachment" if c.get("attached") else ""
+            where = " · 📎 your attachment" if c.get("attached") else (" · 🖼️ figure" if c.get("image") else "")
             st.markdown(f"**[{n}] {c['source']}{page}**{where} — {'✅ cited' if n in cited else 'not cited'}")
+            if c.get("image"):                                     # show the picture itself
+                picture = load_image(files, c["image"], SHARED_FOLDER)
+                if picture:
+                    st.image(picture, width=420)
             st.caption(c["text"][:600] + ("…" if len(c["text"]) > 600 else ""))
 
 
@@ -203,17 +247,28 @@ if admin:                         # normal users never call st.sidebar, so they 
         with st.form("upload", clear_on_submit=True):
             uploads = st.file_uploader("Add PDF, Markdown or text files", type=["pdf", "md", "txt"],
                                        accept_multiple_files=True)
+            read_images = st.checkbox("Also read images inside PDFs", value=True,
+                                      help="Charts, diagrams and photos are described by a vision AI "
+                                           f"({vision_label()}) so they can be searched. Slower uploads.")
             if st.form_submit_button("Add to knowledge base", type="primary", use_container_width=True) and uploads:
                 for f in uploads:
-                    with st.spinner(f"Saving and indexing {f.name}…"):
-                        try:
-                            added = add_document(files, collection, f.name, f.getvalue())
-                            if added:
-                                st.success(f"{f.name}: {added} chunks")
-                            else:
-                                st.info(f"{f.name}: already in the knowledge base")
-                        except Exception as e:
-                            st.error(f"{f.name}: {e}")
+                    bar = st.progress(0.0, text=f"Reading {f.name}…")
+
+                    def progress(done, total, name=f.name, bar=bar):
+                        bar.progress(done / total, text=f"{name}: describing image {done} of {total}…")
+
+                    try:
+                        added, figures = add_document(files, collection, f.name, f.getvalue(),
+                                                      describe_fn=describe_image if read_images else None,
+                                                      progress=progress)
+                        bar.empty()
+                        if added:
+                            st.success(f"{f.name}: {added} chunks" + (f" + {figures} figures" if figures else ""))
+                        else:
+                            st.info(f"{f.name}: already in the knowledge base")
+                    except Exception as e:
+                        bar.empty()
+                        st.error(f"{f.name}: {e}")
                 docs = list_documents(collection)
 
         deleted = st.session_state.pop("_deleted_note", None)
@@ -222,7 +277,8 @@ if admin:                         # normal users never call st.sidebar, so they 
         st.caption(f"{len(docs)} document(s) · {collection.count()} chunks")
         for d in docs:
             left, right = st.columns([5, 1])
-            left.markdown(f"**{d['source']}**  \n{d['chunks']} chunks")
+            figs = f" · {d['figures']} figures" if d.get("figures") else ""
+            left.markdown(f"**{d['source']}**  \n{d['chunks'] - d.get('figures', 0)} chunks{figs}")
             if right.button("🗑️", key=f"del-{d['doc_id']}", help=f"Delete {d['source']}"):
                 confirm_delete(d["source"], d["chunks"])        # opens a "are you sure?" window
 

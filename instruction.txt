@@ -2,3 +2,13 @@
 2. download qwen model: ollama pull qwen3:4b
 3. next time if I want to see list of models in ollama: ollama list
 4. from code i can access using: LLM_MODEL = os.getenv("LLM_MODEL", "qwen3:4b")
+
+
+
+PII masking (PII means personally identifiable information), and it’s a good feature to show in a RAG portfolio. 
+The idea is to replace private details with placeholders before any text is sent to the LLM. 
+The model then never sees them, so it can’t repeat, store or learn them.
+
+Images in pdf: Admin uploads a PDF. As now, the text is extracted. In addition, the app pulls out every image using PyMuPDF, a free PDF library.
+Small images are skipped (logos, icons, lines), so you don’t pay for describing decorations.
+Each remaining image is described once by a vision model, at upload time, not on every question. Online, Groq lists qwen/qwen3.8-27b as a vision model.

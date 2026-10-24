@@ -7,3 +7,4 @@ requests
 streamlit
 groq
 supabase
+pymupdf                # reads images inside PDFs (images.py)

@@ -65,8 +65,10 @@ def shared_collection():
 def list_documents(collection) -> list[dict]:
     docs = {}
     for m in collection.get(include=["metadatas"])["metadatas"]:
-        d = docs.setdefault(m["doc_id"], {"doc_id": m["doc_id"], "source": m["source"], "chunks": 0})
+        d = docs.setdefault(m["doc_id"], {"doc_id": m["doc_id"], "source": m["source"], "chunks": 0, "figures": 0})
         d["chunks"] += 1
+        if m.get("kind") == "image":
+            d["figures"] += 1
     return sorted(docs.values(), key=lambda d: d["source"].lower())
 
 
@@ -84,7 +86,8 @@ class SupabaseFiles:
                       and Path(i["name"]).suffix.lower() in SUPPORTED)
 
     def upload(self, name: str, data: bytes) -> None:
-        content_type = {"pdf": "application/pdf", "md": "text/markdown"}.get(name.rsplit(".", 1)[-1], "text/plain")
+        content_type = {"pdf": "application/pdf", "md": "text/markdown", "png": "image/png",
+                        "json": "application/json"}.get(name.rsplit(".", 1)[-1].lower(), "text/plain")
         self.bucket.upload(f"{SHARED_PREFIX}/{name}", data, {"content-type": content_type, "upsert": "true"})
 
     def download(self, name: str) -> bytes:
@@ -92,6 +95,11 @@ class SupabaseFiles:
 
     def delete(self, name: str) -> None:
         self.bucket.remove([f"{SHARED_PREFIX}/{name}"])
+
+    def list_folder(self, sub: str) -> list[str]:
+        """File names inside a sub-folder, e.g. '_images/<doc_id>'."""
+        items = self.bucket.list(f"{SHARED_PREFIX}/{sub}", {"limit": 1000})
+        return [i["name"] for i in items if i.get("name") and not i["name"].startswith(".")]
 
 
 class LocalFiles:
@@ -104,7 +112,9 @@ class LocalFiles:
         return sorted(p.name for p in SHARED_FOLDER.iterdir() if p.suffix.lower() in SUPPORTED)
 
     def upload(self, name: str, data: bytes) -> None:
-        (SHARED_FOLDER / name).write_bytes(data)
+        target = SHARED_FOLDER / name
+        target.parent.mkdir(parents=True, exist_ok=True)      # e.g. _images/<doc_id>/
+        target.write_bytes(data)
 
     def download(self, name: str) -> bytes:
         return (SHARED_FOLDER / name).read_bytes()
@@ -112,25 +122,46 @@ class LocalFiles:
     def delete(self, name: str) -> None:
         (SHARED_FOLDER / name).unlink(missing_ok=True)
 
+    def list_folder(self, sub: str) -> list[str]:
+        folder = SHARED_FOLDER / sub
+        return [p.name for p in folder.iterdir() if p.is_file()] if folder.is_dir() else []
+
 
 # =========================================================================== admin operations
-def add_document(files, collection, name: str, data: bytes) -> int:
+def add_document(files, collection, name: str, data: bytes, describe_fn=None, progress=None) -> tuple[int, int]:
+    """Save + index one document. For PDFs, describe_fn (a vision model) also turns
+    the PDF's images into searchable figure chunks. Returns (text_chunks, figures)."""
+    from images import add_pdf_images, delete_pdf_images
+
     SHARED_FOLDER.mkdir(parents=True, exist_ok=True)
     name = safe_name(name)
     path = SHARED_FOLDER / name
     if path.exists() and path.read_bytes() != data:          # new version of an existing file
-        collection.delete(where={"doc_id": file_id(path)})
+        old_id = file_id(path)
+        collection.delete(where={"doc_id": old_id})
+        delete_pdf_images(files, old_id)
     files.upload(name, data)
     path.write_bytes(data)
-    return index_file(path, collection)
+    chunks = index_file(path, collection)
+    figures = 0
+    if chunks and describe_fn and path.suffix.lower() == ".pdf":
+        figures = add_pdf_images(files, collection, path, file_id(path), name, describe_fn, progress)
+    return chunks, figures
 
 
 def delete_document(files, collection, name: str) -> None:
+    """Remove a document everywhere: storage, its figures, and all its chunks."""
+    from images import delete_pdf_images
+
+    doc_ids = {m["doc_id"] for m in collection.get(where={"source": name}, include=["metadatas"])["metadatas"]}
     files.delete(name)
     path = SHARED_FOLDER / name
     if path.exists():
-        collection.delete(where={"doc_id": file_id(path)})
+        doc_ids.add(file_id(path))
         path.unlink()
+    for doc_id in doc_ids:
+        delete_pdf_images(files, doc_id)
+        collection.delete(where={"doc_id": doc_id})
     collection.delete(where={"source": name})
 
 
@@ -155,9 +186,13 @@ def ensure_synced(files, collection, force: bool = False) -> dict | None:
             if not path.exists():
                 path.write_bytes(files.download(name))
                 report["downloaded"] += 1
-            present_ids.add(file_id(path))
+            doc_id = file_id(path)
+            present_ids.add(doc_id)
             if index_file(path, collection):
                 report["indexed"] += 1
+                if path.suffix.lower() == ".pdf":         # bring back its figures (no vision calls)
+                    from images import restore_image_chunks
+                    restore_image_chunks(files, collection, doc_id, name)
         for d in list_documents(collection):
             if d["doc_id"] not in present_ids:
                 collection.delete(where={"doc_id": d["doc_id"]})
@@ -213,7 +248,8 @@ def search(collection, attachments: list[dict], question: str, k: int = 4) -> li
         if not n or n_wanted <= 0:
             return []
         r = collection.query(query_embeddings=[q.tolist()], n_results=min(n_wanted, n))
-        return [{"text": t, "source": m["source"], "page": m.get("page") or None, "score": 1 - d, "attached": False}
+        return [{"text": t, "source": m["source"], "page": m.get("page") or None, "score": 1 - d, "attached": False,
+                 "image": m.get("image")}
                 for t, m, d in zip(r["documents"][0], r["metadatas"][0], r["distances"][0])]
 
     if not attachments:
