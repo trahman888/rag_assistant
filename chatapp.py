@@ -229,12 +229,9 @@ messages = st.session_state["messages"]
 first_name = display_name(user).split()[0]
 if not messages:
     with st.chat_message("assistant"):
-        if docs:
-            st.markdown(f"Hi {first_name}! I can answer questions from **{len(docs)}** document(s) in the knowledge base. "
-                        "You can also attach your own files with 📎 for this chat.")
-        else:
-            st.markdown(f"Hi {first_name}! The knowledge base is empty right now. "
-                        + ("Add documents in the sidebar." if admin else "You can attach your own files with 📎 and ask about them."))
+        st.markdown(f"Hi {first_name}! How can I help you today?")
+        if admin and not docs:                 # only the admin is told the knowledge base is empty
+            st.caption("The knowledge base is empty. Add documents in the sidebar.")
 
 for msg in messages:
     with st.chat_message(msg["role"]):
