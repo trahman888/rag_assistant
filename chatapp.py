@@ -30,6 +30,8 @@ import streamlit as st
 from answer import LLM_MODEL, OLLAMA_URL, SYSTEM_PROMPT, find_citations
 from auth import (current_user, display_name, is_admin, log_out, login_page, supabase_client,
                   supabase_enabled, update_name)
+from privacy import PROMPT_NOTE as PRIVACY_NOTE
+from privacy import Masker
 from router import CHAT, chat_system_prompt, route
 from knowledge_base import (LocalFiles, SupabaseFiles, add_document, delete_document, ensure_synced,
                             list_documents, read_attachment, search, shared_collection)
@@ -92,7 +94,19 @@ def sources_for_llm(chunks: list[dict]) -> str:
 
 
 def llm_stream(messages: list[dict], max_tokens: int = 1024, temperature: float = 0.1):
-    """Send messages to the LLM and yield the reply piece by piece."""
+    """EVERY LLM call goes through here, so private details are always masked:
+    emails, phones, card numbers… become <EMAIL_1>, <PHONE_1>… before sending,
+    and the real values are put back into the reply before the user sees it."""
+    masker = Masker()
+    safe = masker.mask_messages(messages)
+    if masker.hidden:                                          # explain the placeholders to the LLM
+        safe[0] = {**safe[0], "content": safe[0]["content"] + "\n\n" + PRIVACY_NOTE}
+    st.session_state["_hidden_count"] = masker.hidden
+    yield from masker.unmask_stream(_raw_llm_stream(safe, max_tokens, temperature))
+
+
+def _raw_llm_stream(messages: list[dict], max_tokens: int, temperature: float):
+    """Send (already masked) messages to Groq or Ollama and yield the reply piece by piece."""
     key = _secret("GROQ_API_KEY")
     if key:                                                   # online: Groq
         from groq import Groq
@@ -142,6 +156,12 @@ def stream_chat_reply(question: str, history: list[dict], doc_names: list[str]):
     recent = [{"role": m["role"], "content": m["content"]} for m in history[-6:]]
     return llm_stream([{"role": "system", "content": system}, *recent,
                        {"role": "user", "content": question}], max_tokens=300, temperature=0.5)
+
+
+def show_privacy_note(hidden: int) -> None:
+    if hidden:
+        st.caption(f"🔒 {hidden} private detail{'s' if hidden != 1 else ''} (emails, phone numbers…) "
+                   "hidden from the AI and restored here.")
 
 
 def show_sources(sources: list[dict], cited: list[int]) -> None:
@@ -256,6 +276,7 @@ for msg in messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if msg["role"] == "assistant":
+            show_privacy_note(msg.get("hidden", 0))
             show_sources(msg.get("sources", []), msg.get("cited", []))
 
 submission = st.chat_input("Ask a question, or attach files with 📎…", accept_file=ATTACH_MODE,
@@ -290,7 +311,7 @@ if submission:
     with st.chat_message("assistant"):
         for p in problems:
             st.warning(p)
-        chunks, cited = [], []
+        chunks, cited, hidden = [], [], 0
 
         if not question:                                   # files only, no question yet
             text = (f"I've read **{', '.join(read_ok)}** for this chat. What would you like to know?"
@@ -302,9 +323,12 @@ if submission:
                 with st.spinner("Thinking…"):
                     kind = route(question, bool(st.session_state["attachments"]), llm_complete)
 
+                st.session_state["_hidden_count"] = 0
                 if kind == CHAT:                           # small talk: no search, no sources
                     text = st.write_stream(stream_chat_reply(question, messages[:-1],
                                                              [d["source"] for d in docs])).strip()
+                    hidden = st.session_state["_hidden_count"]
+                    show_privacy_note(hidden)
                 else:                                      # ---- 4c. search + cited answer
                     with st.spinner("Searching…"):
                         chunks = search(collection, st.session_state["attachments"], question, TOP_K)
@@ -313,9 +337,11 @@ if submission:
                         st.markdown(text)
                     else:
                         text = st.write_stream(stream_answer(question, chunks)).strip()
+                        hidden = st.session_state["_hidden_count"]
                         cited, invalid = find_citations(text, len(chunks))
                         if invalid:
                             st.warning(f"The answer mentions sources that don't exist: {invalid}")
+                        show_privacy_note(hidden)
                         show_sources(chunks, cited)
             except requests.ConnectionError:
                 text = "⚠️ Can't reach the language model right now. Please try again shortly."
@@ -324,6 +350,6 @@ if submission:
                 text = f"⚠️ Something went wrong: {e}"
                 st.error(text)
 
-    messages.append({"role": "assistant", "content": text, "sources": chunks, "cited": cited})
+    messages.append({"role": "assistant", "content": text, "sources": chunks, "cited": cited, "hidden": hidden})
     if read_ok:
         st.rerun()                # redraw so the "📎 In this chat only" banner appears right away
