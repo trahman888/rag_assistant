@@ -11,7 +11,8 @@ TWO MODES (picked automatically)
       wiped on restart, so don't use local mode online.
 
 WHAT THE REST OF THE APP GETS
-    st.session_state["user"] = {"id": "...", "email": "..."}
+    st.session_state["user"] = {"id": "...", "email": "...", "name": "..."}
+    display_name(user) -> the name to show (falls back to the email for old accounts)
     is_admin(user) -> True for emails listed in ADMIN_EMAILS (default below).
 
 ADMIN SAFETY
@@ -102,37 +103,72 @@ def _load_users() -> dict:
     return json.loads(USERS_FILE.read_text()) if USERS_FILE.exists() else {}
 
 
-def _local_sign_up(email: str, password: str) -> dict:
+def _save_users(users: dict) -> None:
+    USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    USERS_FILE.write_text(json.dumps(users, indent=2))
+
+
+def _local_sign_up(email: str, password: str, name: str) -> dict:
     users = _load_users()
     if email in users:
         raise ValueError("An account with this email already exists.")
     salt = secrets.token_hex(16)
-    users[email] = {"id": secrets.token_hex(8), "salt": salt, "hash": _hash(password, salt)}
-    USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    USERS_FILE.write_text(json.dumps(users, indent=2))
-    return {"id": users[email]["id"], "email": email}
+    users[email] = {"id": secrets.token_hex(8), "name": name, "salt": salt, "hash": _hash(password, salt)}
+    _save_users(users)
+    return {"id": users[email]["id"], "email": email, "name": name}
 
 
 def _local_log_in(email: str, password: str) -> dict:
     u = _load_users().get(email)
     if not u or not secrets.compare_digest(u["hash"], _hash(password, u["salt"])):
         raise ValueError("Wrong email or password.")
-    return {"id": u["id"], "email": email}
+    return {"id": u["id"], "email": email, "name": u.get("name", "")}
 
 
 # --------------------------------------------------------------------------- supabase mode
-def _supabase_sign_up(email: str, password: str) -> dict | None:
-    res = supabase_client().auth.sign_up({"email": email, "password": password})
+def _from_supabase(sb_user) -> dict:
+    """Supabase keeps extra profile fields, like the name, in user_metadata."""
+    meta = getattr(sb_user, "user_metadata", None) or {}
+    return {"id": sb_user.id, "email": sb_user.email, "name": (meta.get("full_name") or "").strip()}
+
+
+def _supabase_sign_up(email: str, password: str, name: str) -> dict | None:
+    res = supabase_client().auth.sign_up(
+        {"email": email, "password": password, "options": {"data": {"full_name": name}}})
     if res.session is None:   # project requires email confirmation
         return None
     _remember("sb." + res.session.refresh_token)
-    return {"id": res.user.id, "email": res.user.email}
+    return _from_supabase(res.user)
 
 
 def _supabase_log_in(email: str, password: str) -> dict:
     res = supabase_client().auth.sign_in_with_password({"email": email, "password": password})
     _remember("sb." + res.session.refresh_token)
-    return {"id": res.user.id, "email": res.user.email}
+    return _from_supabase(res.user)
+
+
+# --------------------------------------------------------------------------- names
+def display_name(user: dict) -> str:
+    """The name to show. Accounts created before names existed fall back to the
+    part of the email before the @ (tanzila.himu@… -> Tanzila Himu)."""
+    if user.get("name"):
+        return user["name"]
+    return user["email"].split("@")[0].replace(".", " ").replace("_", " ").title()
+
+
+def update_name(new_name: str) -> None:
+    """Save a new display name for the logged-in user."""
+    new_name = re.sub(r"\s+", " ", new_name).strip()[:60]
+    if not new_name:
+        raise ValueError("Please enter a name.")
+    user = st.session_state["user"]
+    if supabase_enabled():
+        supabase_client().auth.update_user({"data": {"full_name": new_name}})
+    else:
+        users = _load_users()
+        users[user["email"]]["name"] = new_name
+        _save_users(users)
+    user["name"] = new_name
 
 
 # --------------------------------------------------------------------------- "remember me" (page address)
@@ -162,7 +198,10 @@ def _read_local_token(token: str) -> dict | None:
         if not hmac.compare_digest(sig, good):
             return None
         data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        return {"id": data["id"], "email": data["email"]} if data["exp"] > time.time() else None
+        if data["exp"] <= time.time():
+            return None
+        name = _load_users().get(data["email"], {}).get("name", "")    # always the latest name
+        return {"id": data["id"], "email": data["email"], "name": name}
     except Exception:
         return None
 
@@ -185,7 +224,7 @@ def restore_login(token: str) -> None:
         try:
             res = supabase_client().auth.refresh_session(token[3:])
             if res.session and res.user:
-                user = {"id": res.user.id, "email": res.user.email}
+                user = _from_supabase(res.user)
                 _remember("sb." + res.session.refresh_token)     # Supabase rotated it; save the new one
         except Exception:
             user = None
@@ -263,16 +302,19 @@ def login_page(app_name: str, tagline: str) -> None:
                     st.error(_friendly(e))
 
         with sign_up_tab, st.form("signup"):
+            name = re.sub(r"\s+", " ", st.text_input("Full name", key="su_name", max_chars=60)).strip()
             email = st.text_input("Email", key="su_email").strip().lower()
             password = st.text_input("Password (6+ characters)", type="password", key="su_pw")
             confirm = st.text_input("Repeat password", type="password", key="su_pw2")
             if st.form_submit_button("Create account", use_container_width=True):
-                problem = _valid(email, password) or (None if password == confirm else "Passwords don't match.")
+                problem = (("Please enter your name." if not name else None)
+                           or _valid(email, password)
+                           or (None if password == confirm else "Passwords don't match."))
                 if problem:
                     st.error(problem)
                 else:
                     try:
-                        user = (_supabase_sign_up if supabase_enabled() else _local_sign_up)(email, password)
+                        user = (_supabase_sign_up if supabase_enabled() else _local_sign_up)(email, password, name)
                         if user is None:
                             st.success("Account created. Check your email to confirm it, then log in.")
                         else:

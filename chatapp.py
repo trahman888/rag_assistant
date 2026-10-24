@@ -28,7 +28,8 @@ import requests
 import streamlit as st
 
 from answer import LLM_MODEL, OLLAMA_URL, SYSTEM_PROMPT, find_citations
-from auth import current_user, is_admin, log_out, login_page, supabase_client, supabase_enabled
+from auth import (current_user, display_name, is_admin, log_out, login_page, supabase_client,
+                  supabase_enabled, update_name)
 from router import CHAT, chat_system_prompt, route
 from knowledge_base import (LocalFiles, SupabaseFiles, add_document, delete_document, ensure_synced,
                             list_documents, read_attachment, search, shared_collection)
@@ -137,7 +138,7 @@ def stream_answer(question: str, chunks: list[dict]):
 
 def stream_chat_reply(question: str, history: list[dict], doc_names: list[str]):
     """Small-talk reply: no documents, a little recent conversation for context."""
-    system = chat_system_prompt(APP_NAME, doc_names, st.session_state["attached_names"])
+    system = chat_system_prompt(APP_NAME, doc_names, st.session_state["attached_names"], display_name(user))
     recent = [{"role": m["role"], "content": m["content"]} for m in history[-6:]]
     return llm_stream([{"role": "system", "content": system}, *recent,
                        {"role": "user", "content": question}], max_tokens=300, temperature=0.5)
@@ -198,7 +199,16 @@ if admin:                         # normal users never call st.sidebar, so they 
 # =========================================================================== 3. header
 st.title(f"🔎 {APP_NAME}")
 who_col, b1, b2 = st.columns([4, 1, 1], vertical_alignment="center")
-who_col.caption(f"👤 {user['email']}" + (" · **admin**" if admin else ""))
+with who_col.popover(f"👤 {display_name(user)}" + (" · admin" if admin else "")):
+    st.caption(f"Signed in as {user['email']}")
+    with st.form("rename", clear_on_submit=True, border=False):
+        new_name = st.text_input("Your name", placeholder=display_name(user), max_chars=60)
+        if st.form_submit_button("Save name"):
+            try:
+                update_name(new_name)
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
 if b1.button("New chat", use_container_width=True):
     new_chat()
     st.rerun()
@@ -216,13 +226,14 @@ if st.session_state["attached_names"]:
 
 # =========================================================================== 4. chat
 messages = st.session_state["messages"]
+first_name = display_name(user).split()[0]
 if not messages:
     with st.chat_message("assistant"):
         if docs:
-            st.markdown(f"Hi! I can answer questions from **{len(docs)}** document(s) in the knowledge base. "
+            st.markdown(f"Hi {first_name}! I can answer questions from **{len(docs)}** document(s) in the knowledge base. "
                         "You can also attach your own files with 📎 for this chat.")
         else:
-            st.markdown("Hi! The knowledge base is empty right now. "
+            st.markdown(f"Hi {first_name}! The knowledge base is empty right now. "
                         + ("Add documents in the sidebar." if admin else "You can attach your own files with 📎 and ask about them."))
 
 for msg in messages:

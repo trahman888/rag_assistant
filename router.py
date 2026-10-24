@@ -86,7 +86,7 @@ def route(text: str, has_attachments: bool, llm_complete) -> str:
         return SEARCH
 
 
-def chat_system_prompt(app_name: str, doc_names: list[str], attached: list[str]) -> str:
+def chat_system_prompt(app_name: str, doc_names: list[str], attached: list[str], user_name: str = "") -> str:
     docs = ", ".join(doc_names[:15]) + (" …" if len(doc_names) > 15 else "") if doc_names else "none yet"
     files = ", ".join(attached) if attached else "none"
     return f"""You are {app_name}, a friendly assistant that answers questions from a document library.
@@ -97,5 +97,6 @@ If it fits, mention what you can help with: questions about the documents in the
 or about files they attach with the 📎 button.
 Do not answer factual questions from your own knowledge and do not invent document content.
 
+The user's name: {user_name or "unknown"} (use their first name now and then, naturally).
 Documents in the library: {docs}
 Files the user attached in this chat: {files}"""
