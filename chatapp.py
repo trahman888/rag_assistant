@@ -22,6 +22,7 @@ FILES THIS NEEDS
     auth.py, knowledge_base.py, answer.py, vector_store.py (+ files it imports)
 """
 import json
+import re
 import os
 
 import requests
@@ -149,6 +150,11 @@ def stream_answer(question: str, chunks: list[dict]):
         note = ("The user attached their own file(s), marked '(file attached by the user)'. "
                 "When the question refers to 'my file', 'this PDF', 'the document' or similar, "
                 "answer from those sources.\n\n")
+    if any(c.get("image") for c in chunks):
+        note += ("Sources that start with '[Figure on page N]' describe images from the documents. "
+                 "The app shows those images to the user right under your answer, so when the user asks "
+                 "to see a chart, diagram or picture, briefly say what it shows and cite it; never say you "
+                 "can't display images.\n\n")
     user_message = f"{note}<sources>\n{sources_for_llm(chunks)}\n</sources>\n\nQuestion: {question}"
     return llm_stream([{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_message}])
 
@@ -198,10 +204,55 @@ def describe_image(png: bytes, prompt: str) -> str:
     return masker.unmask(text)
 
 
+def md_safe(text: str) -> str:
+    """Streamlit reads text between two $ signs as a math formula ("$8 to $2" breaks),
+    so dollar signs are escaped for display. The stored text keeps the plain $."""
+    return text.replace("$", "\\$")
+
+
+def show_stream(pieces) -> str:
+    """Stream a reply onto the page (with $ made safe) and return the plain text."""
+    collected = []
+
+    def safe_pieces():
+        for p in pieces:
+            collected.append(p)
+            yield md_safe(p)
+
+    st.write_stream(safe_pieces())
+    return "".join(collected).strip()
+
+
 def show_privacy_note(hidden: int) -> None:
     if hidden:
         st.caption(f"🔒 {hidden} private detail{'s' if hidden != 1 else ''} (emails, phone numbers…) "
                    "hidden from the AI and restored here.")
+
+
+_ASKS_FOR_PICTURE = re.compile(r"\b(show|see|display|view|look)\b|\b(image|images|picture|pictures|photo|photos|"
+                               r"figure|figures|fig|chart|charts|graph|graphs|plot|diagram|diagrams|table|screenshot)\b",
+                               re.IGNORECASE)
+MAX_INLINE_FIGURES = 3
+
+
+def figures_to_show(question: str, sources: list[dict], cited: list[int]) -> list[dict]:
+    """Which stored images to show right under the answer:
+    every figure the answer cited, or, if the user asked to see a picture
+    ("show me the chart…") and none was cited, the best-matching figure."""
+    figures = [sources[n - 1] for n in cited if sources[n - 1].get("image")]
+    if not figures and _ASKS_FOR_PICTURE.search(question or ""):
+        figures = [s for s in sources if s.get("image")][:1]
+    unique = list({f["image"]: f for f in figures}.values())
+    return unique[:MAX_INLINE_FIGURES]
+
+
+def show_figures(figures: list[dict]) -> None:
+    """Draw figures directly under the answer (not hidden in the Sources box)."""
+    for f in figures:
+        picture = load_image(files, f["image"], SHARED_FOLDER)
+        if picture:
+            page = f", page {f['page']}" if f.get("page") else ""
+            st.image(picture, caption=f"🖼️ Figure from {f['source']}{page}", width=520)
 
 
 def show_sources(sources: list[dict], cited: list[int]) -> None:
@@ -330,8 +381,9 @@ if not messages:
 
 for msg in messages:
     with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+        st.markdown(md_safe(msg["content"]))
         if msg["role"] == "assistant":
+            show_figures(msg.get("figures", []))
             show_privacy_note(msg.get("hidden", 0))
             show_sources(msg.get("sources", []), msg.get("cited", []))
 
@@ -362,12 +414,12 @@ if submission:
         user_text += "\n\n📎 " + ", ".join(f.name for f in new_files)
     messages.append({"role": "user", "content": user_text})
     with st.chat_message("user"):
-        st.markdown(user_text)
+        st.markdown(md_safe(user_text))
 
     with st.chat_message("assistant"):
         for p in problems:
             st.warning(p)
-        chunks, cited, hidden = [], [], 0
+        chunks, cited, hidden, figures = [], [], 0, []
 
         if not question:                                   # files only, no question yet
             text = (f"I've read **{', '.join(read_ok)}** for this chat. What would you like to know?"
@@ -381,8 +433,7 @@ if submission:
 
                 st.session_state["_hidden_count"] = 0
                 if kind == CHAT:                           # small talk: no search, no sources
-                    text = st.write_stream(stream_chat_reply(question, messages[:-1],
-                                                             [d["source"] for d in docs])).strip()
+                    text = show_stream(stream_chat_reply(question, messages[:-1], [d["source"] for d in docs]))
                     hidden = st.session_state["_hidden_count"]
                     show_privacy_note(hidden)
                 else:                                      # ---- 4c. search + cited answer
@@ -392,12 +443,14 @@ if submission:
                         text = "There's nothing to search yet: the knowledge base is empty and no files are attached."
                         st.markdown(text)
                     else:
-                        text = st.write_stream(stream_answer(question, chunks)).strip()
+                        text = show_stream(stream_answer(question, chunks))
                         hidden = st.session_state["_hidden_count"]
                         cited, invalid = find_citations(text, len(chunks))
                         if invalid:
                             st.warning(f"The answer mentions sources that don't exist: {invalid}")
                         show_privacy_note(hidden)
+                        figures = figures_to_show(question, chunks, cited)
+                        show_figures(figures)
                         show_sources(chunks, cited)
             except requests.ConnectionError:
                 text = "⚠️ Can't reach the language model right now. Please try again shortly."
@@ -406,6 +459,7 @@ if submission:
                 text = f"⚠️ Something went wrong: {e}"
                 st.error(text)
 
-    messages.append({"role": "assistant", "content": text, "sources": chunks, "cited": cited, "hidden": hidden})
+    messages.append({"role": "assistant", "content": text, "sources": chunks, "cited": cited, "hidden": hidden,
+                     "figures": figures})
     if read_ok:
         st.rerun()                # redraw so the "📎 In this chat only" banner appears right away
