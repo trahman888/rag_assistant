@@ -218,7 +218,7 @@ if admin:                         # normal users never call st.sidebar, so they 
 
         deleted = st.session_state.pop("_deleted_note", None)
         if deleted:
-            st.success(f"Deleted {deleted}")
+            st.toast(f"Deleted {deleted}", icon="🗑️")      # small pop-up that disappears by itself
         st.caption(f"{len(docs)} document(s) · {collection.count()} chunks")
         for d in docs:
             left, right = st.columns([5, 1])
