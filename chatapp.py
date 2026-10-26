@@ -76,13 +76,13 @@ if st.session_state.get("_chat_owner") != user["id"]:      # first page load of 
         # Logged in with their password (after logging out, or the login expired):
         # start a new chat; the previous one is kept for "Continue last conversation".
         try:
-            library.archive_chat()
+            st.session_state["_last_chat"] = library.archive_chat() or library.load_last_chat()
         except Exception:
             pass
         st.session_state["messages"] = []
     else:
         st.session_state["messages"] = library.load_chat()   # just a page refresh: carry on where they were
-    st.session_state.pop("_last_chat", None)
+        st.session_state.pop("_last_chat", None)             # looked up when the sidebar needs it
     st.session_state["attachments"], st.session_state["attached_names"] = [], []
     st.session_state["_chat_owner"] = user["id"]
     st.session_state["chat_id"] = uuid.uuid4().hex[:8]
@@ -98,8 +98,9 @@ def save_chat():
 
 
 def new_chat():
-    library.archive_chat()                                      # "Continue last conversation" can bring it back
-    st.session_state.pop("_last_chat", None)
+    archived = library.archive_chat(st.session_state["messages"])   # "Continue last conversation" brings it back
+    if archived:
+        st.session_state["_last_chat"] = archived                # remember it here, don't re-download it
     st.session_state["chat_id"] = uuid.uuid4().hex[:8]          # fresh keys for the 👍/👎 widgets
     st.session_state["messages"] = []
     st.session_state["attachments"] = []
@@ -423,7 +424,7 @@ with st.sidebar:
             st.session_state["_last_chat"] = library.load_last_chat()
         if st.session_state["_last_chat"] and st.button("↩️ Continue last conversation", use_container_width=True,
                                                         help="Bring back your previous chat"):
-            st.session_state["messages"] = library.resume_last_chat()
+            st.session_state["messages"] = library.resume_last_chat(st.session_state["_last_chat"])
             st.session_state["_last_chat"] = []
             st.rerun()
     st.divider()

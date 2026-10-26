@@ -121,7 +121,11 @@ class SupabaseFiles:
                         "json": "application/json",
                         "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                         "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation"}.get(name.rsplit(".", 1)[-1].lower(), "text/plain")
-        self.bucket.upload(f"{self.prefix}/{name}", data, {"content-type": content_type, "upsert": "true"})
+        # Files that get overwritten (chat, settings, feedback…) must not be cached: Supabase's CDN
+        # would otherwise keep serving the OLD copy for up to an hour after an overwrite.
+        cache = "no-cache" if name.endswith(".json") else "3600"
+        self.bucket.upload(f"{self.prefix}/{name}", data,
+                           {"content-type": content_type, "upsert": "true", "cache-control": cache})
 
     def download(self, name: str) -> bytes:
         return self.bucket.download(f"{self.prefix}/{name}")
@@ -379,8 +383,13 @@ class Library:
             return []                                   # no saved chat yet
 
     def save_chat(self, messages: list[dict]) -> None:
-        """Save the conversation in the user's private folder. Passages that came from
-        📎 attachments are saved WITHOUT their text, because attachments are never stored."""
+        """Save the conversation in the user's private folder."""
+        self.files.upload(CHAT_FILE, self._chat_bytes(messages))
+
+    @staticmethod
+    def _chat_bytes(messages: list[dict]) -> bytes:
+        """Passages that came from 📎 attachments are saved WITHOUT their text,
+        because attachments are never stored."""
         keep = []
         for m in messages[-MAX_SAVED_MESSAGES:]:
             m = dict(m)
@@ -388,7 +397,7 @@ class Library:
                 m["sources"] = [{k: v for k, v in c.items() if k != "vector"} | ({"text": "(attached file, not saved)"}
                                 if c.get("attached") else {}) for c in m["sources"]]
             keep.append(m)
-        self.files.upload(CHAT_FILE, json.dumps(keep, default=float).encode())
+        return json.dumps(keep, default=float).encode()
 
     def clear_chat(self) -> None:
         try:
@@ -396,13 +405,17 @@ class Library:
         except Exception:
             pass
 
-    def archive_chat(self) -> None:
-        """Start fresh but keep the current conversation as the "last" one,
-        so the user can choose to continue it. An empty chat doesn't replace the last one."""
-        current = self.load_chat()
+    def archive_chat(self, current: list[dict] | None = None) -> list[dict]:
+        """Start fresh but keep the current conversation as the "last" one, so the user can
+        choose to continue it. Pass the conversation the app has in memory when it has one
+        (more reliable than reading back a file that was just written); otherwise it is read
+        from storage. An empty chat doesn't replace the last one. Returns what was archived."""
+        if current is None:
+            current = self.load_chat()
         if current:
-            self.files.upload(LAST_CHAT_FILE, json.dumps(current, default=float).encode())
+            self.files.upload(LAST_CHAT_FILE, self._chat_bytes(current))
             self.clear_chat()
+        return current or []
 
     def load_last_chat(self) -> list[dict]:
         try:
@@ -411,11 +424,12 @@ class Library:
         except Exception:
             return []
 
-    def resume_last_chat(self) -> list[dict]:
-        """Make the last conversation the current one again."""
-        messages = self.load_last_chat()
+    def resume_last_chat(self, messages: list[dict] | None = None) -> list[dict]:
+        """Make the last conversation the current one again (pass it if the app already has it)."""
+        if not messages:
+            messages = self.load_last_chat()
         if messages:
-            self.files.upload(CHAT_FILE, json.dumps(messages, default=float).encode())
+            self.files.upload(CHAT_FILE, self._chat_bytes(messages))
             try:
                 self.files.delete(LAST_CHAT_FILE)
             except Exception:
