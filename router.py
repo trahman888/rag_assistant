@@ -9,9 +9,9 @@ WHY
 TWO STEPS (fast first, smart second)
     1. Rules (instant, free): obvious small talk — greetings, thanks, goodbyes,
        "how are you", "who are you", "what can you do" — goes straight to CHAT.
-    2. LLM router (one short extra LLM call): anything else is shown to the LLM
-       with a tiny prompt that must answer CHAT or SEARCH. If that call fails,
-       we fall back to SEARCH, which is the old behaviour.
+    2. LLM (one short call): anything else is shown to the LLM, which returns the
+       route plus rewritten search queries as JSON. If that call fails, we fall
+       back to SEARCH with the question as typed.
 
     Messages that mention an attached file ("my pdf", "this document", ...) skip
     both steps and always SEARCH.
@@ -19,7 +19,17 @@ TWO STEPS (fast first, smart second)
 ROUTES
     "chat"    -> a short friendly reply, no documents, no sources box
     "search"  -> the normal RAG answer with citations
+
+QUERY REWRITING (plan())
+    The same LLM call that routes the message also rewrites it into 2–3 search
+    phrases, so it costs no extra call:
+      * a complete, standalone version of the question — follow-ups like
+        "and what about figure 2?" are rewritten using the recent conversation;
+      * the key technical terms and names (good for keyword search);
+      * for figure requests, a description of what the figure would show.
+    knowledge_base.search() searches all of them plus the original question.
 """
+import json
 import re
 
 CHAT, SEARCH = "chat", "search"
@@ -38,19 +48,6 @@ _SMALL_TALK = re.compile(r"""^(
 
 _ABOUT_ATTACHMENT = re.compile(r"\b(my|this|the|attached|uploaded)\s+(pdf|file|document|doc|notes?|paper|report)s?\b",
                                re.IGNORECASE)
-
-ROUTER_PROMPT = """You route messages for a document question-answering assistant.
-
-Reply CHAT if the message is small talk or about the conversation itself: greetings,
-thanks, feelings, jokes, compliments, goodbyes, or questions about the assistant.
-
-Reply SEARCH if answering it needs information from documents: any factual question,
-request to explain, summarise, compare, list or find something, or anything about a
-topic, person, method, number or file.
-
-When unsure, reply SEARCH.
-Reply with exactly one word: CHAT or SEARCH."""
-
 
 def _clean(text: str) -> str:
     text = re.sub(r"[!?.,:;~\s]+$", "", text.strip())      # trailing punctuation / emoji-ish spacing
@@ -73,17 +70,80 @@ def quick_route(text: str, has_attachments: bool) -> str | None:
     return None
 
 
-def route(text: str, has_attachments: bool, llm_complete) -> str:
-    """Full decision. llm_complete(messages) -> str is the app's non-streaming LLM call."""
+PLAN_PROMPT = """You prepare messages for a question-answering assistant that searches a library of documents.
+
+1. Decide the route:
+   "chat"   = small talk or about the conversation itself: greetings, thanks, feelings, jokes,
+              compliments, goodbyes, questions about the assistant.
+   "search" = anything that needs information from the documents: factual questions, requests
+              to explain, summarise, compare, list, find or SHOW something (a figure, chart,
+              table, picture), or anything about a topic, method, person, number or file.
+   When unsure, choose "search".
+
+2. If "search", write 2 or 3 short search queries (each under 15 words) that would find the
+   answer in the documents:
+   - first: the question rewritten as a complete, standalone question. Resolve words like
+     "it", "that", "this figure", "the second one" using the recent conversation.
+   - second: the key terms only — technical words, acronyms, names, numbers.
+   - if the user wants a figure/chart/diagram/table: a phrase describing what it would show.
+   Don't answer the question; don't invent facts or names that aren't in the conversation.
+
+Reply with JSON only, no other text:
+{"route": "search", "queries": ["...", "..."]}   or   {"route": "chat", "queries": []}"""
+
+
+def _history_text(history: list[dict] | None) -> str:
+    if not history:
+        return "(none)"
+    lines = []
+    for m in history[-4:]:
+        content = re.sub(r"\s+", " ", m.get("content", ""))[:300]
+        lines.append(f"{m.get('role', 'user')}: {content}")
+    return "\n".join(lines)
+
+
+def _parse_plan(reply: str) -> tuple[str, list[str]] | None:
+    reply = re.sub(r"<think>.*?</think>", "", reply or "", flags=re.S)
+    m = re.search(r"\{.*\}", reply, re.S)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            route_ = CHAT if str(data.get("route", "")).lower().strip() == "chat" else SEARCH
+            queries = [str(q).strip() for q in (data.get("queries") or []) if str(q).strip()]
+            return route_, [q[:200] for q in queries[:3]]
+        except (ValueError, AttributeError):
+            pass
+    up = (reply or "").upper()                   # the model ignored JSON: fall back to a plain word
+    if re.search(r"\bCHAT\b", up) and "SEARCH" not in up:
+        return CHAT, []
+    return None
+
+
+def plan(text: str, has_attachments: bool, llm_complete, history: list[dict] | None = None) -> tuple[str, list[str]]:
+    """Route AND rewrite in one step. Returns (route, extra_search_queries).
+    llm_complete(messages) -> str is the app's non-streaming LLM call."""
     quick = quick_route(text, has_attachments)
-    if quick:
-        return quick
+    if quick == CHAT:
+        return CHAT, []                          # obvious small talk: no LLM call at all
     try:
-        reply = llm_complete([{"role": "system", "content": ROUTER_PROMPT},
-                              {"role": "user", "content": text}])
-        return CHAT if re.search(r"\bCHAT\b", reply.upper()) and "SEARCH" not in reply.upper() else SEARCH
+        reply = llm_complete([
+            {"role": "system", "content": PLAN_PROMPT},
+            {"role": "user", "content": f"Recent conversation:\n{_history_text(history)}\n\nNew message: {text}"},
+        ])
+        parsed = _parse_plan(reply)
     except Exception:
-        return SEARCH
+        parsed = None
+    if parsed is None:
+        return SEARCH, []                        # router failed: search with the question as typed
+    route_, queries = parsed
+    if quick == SEARCH:                          # e.g. "summarise my pdf" with an attachment
+        route_ = SEARCH
+    return route_, queries
+
+
+def route(text: str, has_attachments: bool, llm_complete) -> str:
+    """Route only (kept for compatibility); see plan()."""
+    return plan(text, has_attachments, llm_complete)[0]
 
 
 def chat_system_prompt(app_name: str, doc_names: list[str], attached: list[str], user_name: str = "") -> str:

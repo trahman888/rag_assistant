@@ -262,13 +262,13 @@ def add_pdf_images(files, collection, pdf_path: Path, doc_id: str, source: str,
 
 
 def _index(collection, doc_id: str, source: str, records: list[dict]) -> None:
-    from vector_store import embed
+    from embedder import embed_passages
 
     texts = [f"[Figure on page {r['page']}]" + (f" {r['caption'].rstrip('. ')}." if r.get("caption") else "")
              + f" {r['description']}" for r in records]
     collection.upsert(
         ids=[f"{doc_id}-img-{r['file']}" for r in records],
-        embeddings=embed(texts),
+        embeddings=embed_passages(texts),
         documents=texts,
         metadatas=[{"doc_id": doc_id, "source": source, "page": r["page"], "kind": "image",
                     "image": f"{IMAGES_DIR}/{doc_id}/{r['file']}", "caption": r.get("caption", ""),

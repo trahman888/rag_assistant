@@ -33,7 +33,7 @@ from auth import (current_user, display_name, is_admin, log_out, login_page, sup
                   supabase_enabled, update_name)
 from privacy import PROMPT_NOTE as PRIVACY_NOTE
 from privacy import Masker
-from router import CHAT, chat_system_prompt, route
+from router import CHAT, chat_system_prompt, plan
 from images import load_image
 from knowledge_base import (SHARED_FOLDER, LocalFiles, SupabaseFiles, add_document, delete_document,
                             ensure_synced, list_documents, read_attachment, search, shared_collection)
@@ -140,7 +140,7 @@ def _raw_llm_stream(messages: list[dict], max_tokens: int, temperature: float):
 
 def llm_complete(messages: list[dict]) -> str:
     """Same LLM, whole reply at once (used by the router)."""
-    return "".join(llm_stream(messages, max_tokens=300, temperature=0.0)).strip()
+    return "".join(llm_stream(messages, max_tokens=600, temperature=0.0)).strip()
 
 
 def stream_answer(question: str, chunks: list[dict]):
@@ -256,10 +256,12 @@ def show_figures(figures: list[dict]) -> None:
             st.image(picture, caption=f"{label}{f['source']}{page}", width=520)
 
 
-def show_sources(sources: list[dict], cited: list[int]) -> None:
+def show_sources(sources: list[dict], cited: list[int], queries: list[str] | None = None) -> None:
     if not sources:
         return
     with st.expander(f"📄 Sources ({len(cited)} cited of {len(sources)})"):
+        if queries:
+            st.caption("🔎 Searched for: " + " · ".join(f"“{q}”" for q in queries))
         for n, c in enumerate(sources, start=1):
             page = f", page {c['page']}" if c.get("page") else ""
             where = " · 📎 your attachment" if c.get("attached") else (" · 🖼️ figure" if c.get("image") else "")
@@ -391,7 +393,7 @@ for msg in messages:
         if msg["role"] == "assistant":
             show_figures(msg.get("figures", []))
             show_privacy_note(msg.get("hidden", 0))
-            show_sources(msg.get("sources", []), msg.get("cited", []))
+            show_sources(msg.get("sources", []), msg.get("cited", []), msg.get("queries"))
 
 submission = st.chat_input("Ask a question, or attach files with 📎…", accept_file=ATTACH_MODE,
                            file_type=["pdf", "md", "txt"], max_upload_size=MAX_FILE_MB)
@@ -425,7 +427,7 @@ if submission:
     with st.chat_message("assistant"):
         for p in problems:
             st.warning(p)
-        chunks, cited, hidden, figures = [], [], 0, []
+        chunks, cited, hidden, figures, search_queries = [], [], 0, [], []
 
         if not question:                                   # files only, no question yet
             text = (f"I've read **{', '.join(read_ok)}** for this chat. What would you like to know?"
@@ -435,7 +437,9 @@ if submission:
             try:
                 # ---- 4b. decide first: small talk, or a question for the documents?
                 with st.spinner("Thinking…"):
-                    kind = route(question, bool(st.session_state["attachments"]), llm_complete)
+                    # one LLM call: is this small talk? and if not, which search phrases to use
+                    kind, search_queries = plan(question, bool(st.session_state["attachments"]),
+                                                llm_complete, history=messages[:-1])
 
                 st.session_state["_hidden_count"] = 0
                 if kind == CHAT:                           # small talk: no search, no sources
@@ -444,7 +448,8 @@ if submission:
                     show_privacy_note(hidden)
                 else:                                      # ---- 4c. search + cited answer
                     with st.spinner("Searching…"):
-                        chunks = search(collection, st.session_state["attachments"], question, TOP_K)
+                        chunks = search(collection, st.session_state["attachments"], question, TOP_K,
+                                        queries=search_queries)
                     if not chunks:
                         text = "There's nothing to search yet: the knowledge base is empty and no files are attached."
                         st.markdown(text)
@@ -457,7 +462,7 @@ if submission:
                         show_privacy_note(hidden)
                         figures = figures_to_show(question, chunks, cited)
                         show_figures(figures)
-                        show_sources(chunks, cited)
+                        show_sources(chunks, cited, search_queries)
             except requests.ConnectionError:
                 text = "⚠️ Can't reach the language model right now. Please try again shortly."
                 st.error(text)
@@ -466,6 +471,6 @@ if submission:
                 st.error(text)
 
     messages.append({"role": "assistant", "content": text, "sources": chunks, "cited": cited, "hidden": hidden,
-                     "figures": figures})
+                     "figures": figures, "queries": search_queries})
     if read_ok:
         st.rerun()                # redraw so the "📎 In this chat only" banner appears right away
