@@ -171,7 +171,62 @@ def vision_label() -> str:
     return f"{GROQ_VISION_MODEL} on Groq" if _secret("GROQ_API_KEY") else f"{LOCAL_VISION_MODEL} on Ollama"
 
 
-def describe_image(png: bytes, prompt: str) -> str:
+VISION_MAX_TOKENS = 300      # a 2–6 sentence description needs ~150–250; Groq's free tier caps output per minute
+VISION_RETRIES = 5
+
+
+def _groq_vision(key: str, prompt: str, b64: str, on_wait=None) -> str:
+    """One Groq vision request, staying inside the free tier's per-minute limits:
+      * asks for at most VISION_MAX_TOKENS (a request asking for more than the
+        per-minute output limit is refused outright);
+      * turns the model's hidden "thinking" off (it would use up that limit);
+      * on "429 rate limit", waits as long as Groq says, then tries again."""
+    import time
+
+    from groq import BadRequestError, Groq, RateLimitError
+
+    client = Groq(api_key=key)
+    extra = {"reasoning_effort": "none"}                     # supported by qwen/qwen3.8-27b
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+    ]}]
+    for attempt in range(1, VISION_RETRIES + 1):
+        try:
+            resp = client.chat.completions.create(model=GROQ_VISION_MODEL, temperature=0.1,
+                                                  max_tokens=VISION_MAX_TOKENS, messages=messages, **extra)
+            return resp.choices[0].message.content or ""
+        except BadRequestError as e:
+            if extra and "reasoning" in str(e).lower():     # a model without this option: retry without it
+                extra = {}
+                continue
+            raise
+        except RateLimitError as e:
+            if attempt == VISION_RETRIES:
+                raise
+            wait = _retry_after_seconds(e)
+            if on_wait:
+                on_wait(wait)
+            time.sleep(wait)
+    raise RuntimeError("vision model kept refusing requests")
+
+
+def _retry_after_seconds(error) -> float:
+    """How long Groq asks us to wait: the retry-after header, or 'try again in 12.3s' in the message."""
+    import re as _re
+    try:
+        header = error.response.headers.get("retry-after")
+        if header:
+            return min(65.0, float(header) + 1)
+    except Exception:
+        pass
+    m = _re.search(r"try again in\s+(?:(\d+)m)?([\d.]+)s", str(error))
+    if m:
+        return min(65.0, int(m.group(1) or 0) * 60 + float(m.group(2)) + 1)
+    return 20.0
+
+
+def describe_image(png: bytes, prompt: str, on_wait=None) -> str:
     """Ask a vision model to describe one image (used when the admin uploads a PDF).
     The prompt includes text from the PDF page, so it is privacy-masked like everything else."""
     import base64
@@ -183,14 +238,7 @@ def describe_image(png: bytes, prompt: str) -> str:
 
     key = _secret("GROQ_API_KEY")
     if key:                                                   # online: Groq vision model
-        from groq import Groq
-        resp = Groq(api_key=key).chat.completions.create(
-            model=GROQ_VISION_MODEL, temperature=0.1, max_tokens=1024,
-            messages=[{"role": "user", "content": [
-                {"type": "text", "text": safe_prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-            ]}])
-        text = resp.choices[0].message.content or ""
+        text = _groq_vision(key, safe_prompt, b64, on_wait)
     else:                                                     # local: Ollama vision model
         r = requests.post(f"{OLLAMA_URL}/api/chat", timeout=(10, 300), json={
             "model": LOCAL_VISION_MODEL, "stream": False, "think": False,
@@ -308,13 +356,22 @@ if admin:                         # normal users never call st.sidebar, so they 
                 for f in uploads:
                     bar = st.progress(0.0, text=f"Reading {f.name}…")
 
-                    def progress(done, total, name=f.name, bar=bar):
+                    state = {"done": 0, "total": 1}
+
+                    def progress(done, total, name=f.name, bar=bar, state=state):
+                        state.update(done=done, total=total)
                         bar.progress(done / total, text=f"{name}: describing image {done} of {total}…")
+
+                    def waiting(seconds, name=f.name, bar=bar, state=state):
+                        bar.progress(state["done"] / state["total"],
+                                     text=f"{name}: Groq free-tier limit reached, waiting {seconds:.0f} s before "
+                                          f"image {state['done']} of {state['total']}…")
 
                     image_errors = []
                     try:
                         added, figures = add_document(files, collection, f.name, f.getvalue(),
-                                                      describe_fn=describe_image if read_images else None,
+                                                      describe_fn=(lambda png, prompt, w=waiting: describe_image(png, prompt, on_wait=w))
+                                                      if read_images else None,
                                                       progress=progress, on_error=image_errors.append)
                         bar.empty()
                         if added:
