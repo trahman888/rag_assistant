@@ -7,6 +7,7 @@ ONE LIBRARY PER USER (class Library)
                     <user_id>/_images/<doc_id>/p2_1.png   (figures + index.json)
                     <user_id>/_settings.json              (that user's Top K)
                     <user_id>/_chat.json                  (their current conversation)
+                    <user_id>/_last_chat.json             (the one before, for "Continue last conversation")
                     <user_id>/_feedback.json              (their 👍/👎 on answers)
                     <user_id>/_eval.json, _eval_runs.json (their test questions + results)
                 Supabase's security rules only let a logged-in user touch the
@@ -67,6 +68,7 @@ MAX_FIGURES_PER_PDF = 10    # figures described per PDF (each one uses the visio
 DEFAULT_SETTINGS = {"top_k": 4}
 SETTINGS_FILE = "_settings.json"
 CHAT_FILE = "_chat.json"
+LAST_CHAT_FILE = "_last_chat.json"
 FEEDBACK_FILE = "_feedback.json"
 MAX_FEEDBACK = 500
 MAX_SAVED_MESSAGES = 60     # older messages of a very long chat are not kept
@@ -393,6 +395,32 @@ class Library:
             self.files.delete(CHAT_FILE)
         except Exception:
             pass
+
+    def archive_chat(self) -> None:
+        """Start fresh but keep the current conversation as the "last" one,
+        so the user can choose to continue it. An empty chat doesn't replace the last one."""
+        current = self.load_chat()
+        if current:
+            self.files.upload(LAST_CHAT_FILE, json.dumps(current, default=float).encode())
+            self.clear_chat()
+
+    def load_last_chat(self) -> list[dict]:
+        try:
+            messages = json.loads(self.files.download(LAST_CHAT_FILE))
+            return messages if isinstance(messages, list) else []
+        except Exception:
+            return []
+
+    def resume_last_chat(self) -> list[dict]:
+        """Make the last conversation the current one again."""
+        messages = self.load_last_chat()
+        if messages:
+            self.files.upload(CHAT_FILE, json.dumps(messages, default=float).encode())
+            try:
+                self.files.delete(LAST_CHAT_FILE)
+            except Exception:
+                pass
+        return messages
 
     # ------------------------------------------------------------------ small JSON files (feedback, evaluation)
     def load_json(self, name: str, default):

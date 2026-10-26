@@ -71,8 +71,18 @@ try:
 except Exception as e:
     st.error(f"Couldn't load your documents: {e}")
 
-if st.session_state.get("_chat_owner") != user["id"]:      # new browser session (e.g. a refresh) or new user
-    st.session_state["messages"] = library.load_chat()       # bring back their last conversation
+if st.session_state.get("_chat_owner") != user["id"]:      # first page load of this browser session
+    if st.session_state.pop("_fresh_login", False):
+        # Logged in with their password (after logging out, or the login expired):
+        # start a new chat; the previous one is kept for "Continue last conversation".
+        try:
+            library.archive_chat()
+        except Exception:
+            pass
+        st.session_state["messages"] = []
+    else:
+        st.session_state["messages"] = library.load_chat()   # just a page refresh: carry on where they were
+    st.session_state.pop("_last_chat", None)
     st.session_state["attachments"], st.session_state["attached_names"] = [], []
     st.session_state["_chat_owner"] = user["id"]
     st.session_state["chat_id"] = uuid.uuid4().hex[:8]
@@ -88,7 +98,8 @@ def save_chat():
 
 
 def new_chat():
-    library.clear_chat()
+    library.archive_chat()                                      # "Continue last conversation" can bring it back
+    st.session_state.pop("_last_chat", None)
     st.session_state["chat_id"] = uuid.uuid4().hex[:8]          # fresh keys for the 👍/👎 widgets
     st.session_state["messages"] = []
     st.session_state["attachments"] = []
@@ -523,6 +534,18 @@ first_name = display_name(user).split()[0]
 if not messages:
     with st.chat_message("assistant"):
         st.markdown(f"Hi {first_name}! How can I help you today?")
+        if "_last_chat" not in st.session_state:                    # look it up once per session
+            st.session_state["_last_chat"] = library.load_last_chat()
+        last_chat = st.session_state["_last_chat"]
+        if last_chat:
+            first_q = next((m["content"] for m in last_chat if m["role"] == "user"), "")
+            first_q = first_q.split("\n")[0][:70] + ("…" if len(first_q) > 70 else "")
+            asked = sum(m["role"] == "user" for m in last_chat)
+            if st.button("↩️ Continue last conversation", help="Bring back your previous chat"):
+                st.session_state["messages"] = library.resume_last_chat()
+                st.session_state["_last_chat"] = []
+                st.rerun()
+            st.caption(f"{asked} question{'s' if asked != 1 else ''}, starting with “{md_safe(first_q)}”")
         if not docs:
             st.caption("Your library is empty. Add documents in the sidebar (they stay private to you), "
                        "or attach a file here with 📎 for this chat only.")
@@ -617,5 +640,7 @@ if submission:
     save_chat()
     with answer_box:
         feedback_widget(len(messages) - 1)                   # so a page refresh brings the conversation back
-    if read_ok:
-        st.rerun()                # redraw so the "📎 In this chat only" banner appears right away
+    if read_ok or len(messages) == 2:
+        # redraw: shows the "📎 In this chat only" banner, and after the first answer of a chat
+        # removes the greeting (and its "Continue last conversation" button)
+        st.rerun()

@@ -221,6 +221,7 @@ def restore_login(token: str) -> None:
 
 def _logged_in(user: dict) -> None:
     st.session_state["user"] = user
+    st.session_state["_fresh_login"] = True    # typed their password: start with a new chat (chatapp.py)
     st.session_state.pop("_logged_out", None)
     st.session_state.pop("_restore_failed", None)
     if not supabase_enabled():                 # Supabase mode already saved its refresh token
