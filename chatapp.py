@@ -403,18 +403,27 @@ docs = library.documents()
 
 with st.sidebar:
     # ---- conversation shortcuts (light, menu-style links like ChatGPT/Claude; the account menu is at the bottom)
-    if st.button("New chat", icon=":material/edit_square:", type="tertiary", help="Start an empty chat"):
-        new_chat()
-        st.rerun()
-    if not st.session_state["messages"]:                    # offered while the current chat is still empty
-        if "_last_chat" not in st.session_state:            # look it up once per session
-            st.session_state["_last_chat"] = library.load_last_chat()
-        if st.session_state["_last_chat"] and st.button("Continue last conversation", icon=":material/history:",
-                                                        type="tertiary", help="Bring back your previous chat"):
-            st.session_state["messages"] = library.resume_last_chat(st.session_state["_last_chat"])
-            st.session_state["_last_chat"] = []
+    st.html("""<style>
+      /* less empty space at the top of the sidebar and between the links */
+      [data-testid="stSidebarHeader"] { height: 2.6rem; padding-top: 0.6rem; padding-bottom: 0; }
+      [data-testid="stSidebarUserContent"] { padding-top: 0.25rem; }
+      .st-key-chat_links { gap: 0.15rem; }
+      .st-key-chat_links button { padding-top: 0.15rem; padding-bottom: 0.15rem; min-height: 2rem; }
+      .st-key-chat_links hr { margin: 0.5rem 0 0.75rem; }
+    </style>""")
+    with st.container(key="chat_links"):
+        if st.button("New chat", icon=":material/edit_square:", type="tertiary", help="Start an empty chat"):
+            new_chat()
             st.rerun()
-    st.divider()
+        if not st.session_state["messages"]:                    # offered while the current chat is still empty
+            if "_last_chat" not in st.session_state:            # look it up once per session
+                st.session_state["_last_chat"] = library.load_last_chat()
+            if st.session_state["_last_chat"] and st.button("Continue last conversation", icon=":material/history:",
+                                                            type="tertiary", help="Bring back your previous chat"):
+                st.session_state["messages"] = library.resume_last_chat(st.session_state["_last_chat"])
+                st.session_state["_last_chat"] = []
+                st.rerun()
+        st.divider()
 
     view = st.segmented_control("View", ["💬 Chat", "📊 Evaluation"], default="💬 Chat", key="view",
                                 label_visibility="collapsed") or "💬 Chat"
