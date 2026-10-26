@@ -400,30 +400,15 @@ def confirm_delete(name: str, n_chunks: int) -> None:
 docs = library.documents()
 
 with st.sidebar:
-    # ---- account + conversation controls
-    who_col, out_col = st.columns([3, 2], vertical_alignment="center")
-    with who_col.popover(f"👤 {display_name(user)}", use_container_width=True):
-        st.caption(f"Signed in as {user['email']}")
-        with st.form("rename", clear_on_submit=True, border=False):
-            new_name = st.text_input("Your name", placeholder=display_name(user), max_chars=60)
-            if st.form_submit_button("Save name"):
-                try:
-                    update_name(new_name)
-                    st.rerun()
-                except Exception as e:
-                    st.error(str(e))
-    if out_col.button("Log out", use_container_width=True):
-        log_out()
-        st.rerun()
-
-    if st.button("➕ New chat", use_container_width=True):
+    # ---- conversation shortcuts (light, menu-style links like ChatGPT/Claude; the account menu is at the bottom)
+    if st.button("New chat", icon=":material/edit_square:", type="tertiary", help="Start an empty chat"):
         new_chat()
         st.rerun()
     if not st.session_state["messages"]:                    # offered while the current chat is still empty
         if "_last_chat" not in st.session_state:            # look it up once per session
             st.session_state["_last_chat"] = library.load_last_chat()
-        if st.session_state["_last_chat"] and st.button("↩️ Continue last conversation", use_container_width=True,
-                                                        help="Bring back your previous chat"):
+        if st.session_state["_last_chat"] and st.button("Continue last conversation", icon=":material/history:",
+                                                        type="tertiary", help="Bring back your previous chat"):
             st.session_state["messages"] = library.resume_last_chat(st.session_state["_last_chat"])
             st.session_state["_last_chat"] = []
             st.rerun()
@@ -516,6 +501,29 @@ with st.sidebar:
     st.divider()
     llm = f"`{GROQ_MODEL}` (Groq)" if _secret("GROQ_API_KEY") else f"`{LLM_MODEL}` (Ollama)"
     st.caption(f"LLM: {llm}")
+
+    # ---- account menu: name, email, rename, log out (pinned to the bottom of the sidebar)
+    st.html("""<style>
+      [data-testid="stLayoutWrapper"]:has(> .st-key-account_menu), .st-key-account_menu {
+          position: sticky; bottom: 0; z-index: 5; }
+      .st-key-account_menu { padding: 12px 0 14px; background: var(--sb-bg); border-top: 1px solid rgba(128, 128, 128, 0.2); }
+      section[data-testid="stSidebar"] { --sb-bg: rgb(240, 242, 246); }
+      @media (prefers-color-scheme: dark) { section[data-testid="stSidebar"] { --sb-bg: rgb(38, 39, 48); } }
+    </style>""")
+    with st.container(key="account_menu"), st.popover(display_name(user), icon=":material/account_circle:", use_container_width=True):
+        st.caption(f"Signed in as {user['email']}")
+        with st.form("rename", clear_on_submit=True, border=False):
+            new_name = st.text_input("Your name", placeholder=display_name(user), max_chars=60)
+            if st.form_submit_button("Save name", icon=":material/badge:"):
+                try:
+                    update_name(new_name)
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+        st.divider()
+        if st.button("Log out", icon=":material/logout:", type="tertiary"):
+            log_out()
+            st.rerun()
 
 
 # =========================================================================== evaluation page
