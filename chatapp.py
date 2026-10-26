@@ -428,7 +428,7 @@ with st.sidebar:
     view = st.segmented_control("View", ["💬 Chat", "📊 Evaluation"], default="💬 Chat", key="view",
                                 label_visibility="collapsed") or "💬 Chat"
     st.header("📁 My documents")
-    st.caption("Private to you: other users can't see or search these files.")
+    #st.caption("Private to you: other users can't see or search these files.")
     st.caption(f"Limits: {MAX_DOCUMENTS} documents · {MAX_LIBRARY_FILE_MB} MB per file · "
                f"{MAX_FIGURES_PER_PDF} figures read per PDF")
 
