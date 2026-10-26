@@ -36,14 +36,15 @@ from privacy import Masker
 from router import CHAT, chat_system_prompt, plan
 from images import load_image
 from knowledge_base import (SHARED_FOLDER, LocalFiles, SupabaseFiles, add_document, delete_document,
-                            ensure_synced, list_documents, read_attachment, search, shared_collection)
+                            ensure_synced, get_settings, list_documents, read_attachment, save_setting, search,
+                            shared_collection)
 
 APP_NAME = "Personal Assistant"    # title on the login page, chat page and browser tab
 TAGLINE = "Ask questions across the knowledge base and get answers grounded in sources."
 GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_VISION_MODEL = "qwen/qwen3.8-27b"   # reads images (admin uploads only)
 LOCAL_VISION_MODEL = "qwen2.5vl:3b"      # Ollama vision model for local mode: ollama pull qwen2.5vl:3b
-TOP_K = 4                        # sources per answer
+TOP_K = 4                        # default sources per answer; the admin can change it in the sidebar
 ATTACH_MODE = "multiple"         # "multiple" = pick files, "directory" = pick a whole folder
 MAX_ATTACHED_FILES = 10          # per chat, to keep memory use small
 MAX_FILE_MB = 20
@@ -60,6 +61,7 @@ if not user:
 admin = is_admin(user)
 files = SupabaseFiles(supabase_client()) if supabase_enabled() else LocalFiles()
 collection = shared_collection()
+settings = get_settings(files)          # admin-chosen, app-wide (e.g. sources per answer)
 
 try:
     with st.spinner("Preparing the knowledge base…"):
@@ -398,6 +400,23 @@ if admin:                         # normal users never call st.sidebar, so they 
             if right.button("🗑️", key=f"del-{d['doc_id']}", help=f"Delete {d['source']}"):
                 confirm_delete(d["source"], d["chunks"])        # opens a "are you sure?" window
 
+        st.divider()
+        st.subheader("⚙️ Answer settings")
+        current_k = settings["sources_per_answer"]
+        new_k = st.slider("Top K (passages retrieved per answer)", min_value=2, max_value=10, value=current_k,
+                          help="Top K = how many of the best-matching passages are retrieved and given to the AI "
+                               "for each answer. The AI then cites only the ones it actually uses. Higher K gives "
+                               "fuller answers but uses more of the AI's free quota. Applies to everyone.")
+        st.caption(f"Currently retrieving the top **{current_k}** passages per question.")
+        if new_k != current_k:
+            try:
+                save_setting(files, "sources_per_answer", new_k)
+                settings["sources_per_answer"] = new_k
+                st.toast(f"Top K set to {new_k}", icon="⚙️")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Couldn't save the setting: {e}")
+
         if st.button("🔄 Reload from storage", use_container_width=True):
             ensure_synced(files, collection, force=True)
             st.rerun()
@@ -505,7 +524,8 @@ if submission:
                     show_privacy_note(hidden)
                 else:                                      # ---- 4c. search + cited answer
                     with st.spinner("Searching…"):
-                        chunks = search(collection, st.session_state["attachments"], question, TOP_K,
+                        chunks = search(collection, st.session_state["attachments"], question,
+                                        settings["sources_per_answer"],
                                         queries=search_queries)
                     if not chunks:
                         text = "There's nothing to search yet: the knowledge base is empty and no files are attached."

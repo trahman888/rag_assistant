@@ -205,6 +205,38 @@ def delete_document(files, collection, name: str) -> None:
     keyword_index_changed()
 
 
+# =========================================================================== app settings (admin)
+SETTINGS_FILE = "_settings.json"          # stored next to the documents, so it survives restarts
+DEFAULT_SETTINGS = {"sources_per_answer": 4}
+_settings_lock = threading.Lock()
+_settings: dict | None = None
+
+
+def get_settings(files) -> dict:
+    """App-wide settings chosen by the admin (read once per server, then cached)."""
+    global _settings
+    with _settings_lock:
+        if _settings is None:
+            import json
+            try:
+                saved = json.loads(files.download(SETTINGS_FILE))
+            except Exception:
+                saved = {}                        # nothing saved yet: use the defaults
+            _settings = {**DEFAULT_SETTINGS, **{k: v for k, v in saved.items() if k in DEFAULT_SETTINGS}}
+        return dict(_settings)
+
+
+def save_setting(files, key: str, value) -> None:
+    """Change one setting for everyone and save it permanently (admin only: storage rules enforce it)."""
+    import json
+    global _settings
+    current = get_settings(files)
+    current[key] = value
+    files.upload(SETTINGS_FILE, json.dumps(current, indent=2).encode())
+    with _settings_lock:
+        _settings = current
+
+
 # =========================================================================== sync after restart
 _sync_lock = threading.Lock()
 _synced = False
