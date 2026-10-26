@@ -38,7 +38,7 @@ from images import load_image
 from knowledge_base import (MAX_DOCUMENTS, MAX_FIGURES_PER_PDF, LimitError, Library, read_attachment)
 from knowledge_base import MAX_FILE_MB as MAX_LIBRARY_FILE_MB
 
-APP_NAME = "Personal Assistant"    # title on the login page, chat page and browser tab
+APP_NAME = "Personal Document Assistant"    # title on the login page, chat page and browser tab
 TAGLINE = "Upload your own documents and get answers grounded in sources. Private to you."
 GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_VISION_MODEL = "qwen/qwen3.8-27b"   # describes figures in uploaded PDFs
