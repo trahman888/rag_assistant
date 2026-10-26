@@ -34,11 +34,13 @@ from auth import (current_user, display_name, log_out, login_page, supabase_clie
 from privacy import PROMPT_NOTE as PRIVACY_NOTE
 from privacy import Masker
 from router import CHAT, chat_system_prompt, plan
+import time as _time
+import uuid
 from images import load_image
 from knowledge_base import (MAX_DOCUMENTS, MAX_FIGURES_PER_PDF, LimitError, Library, read_attachment)
 from knowledge_base import MAX_FILE_MB as MAX_LIBRARY_FILE_MB
 
-APP_NAME = "My Document Assistant"    # title on the login page, chat page and browser tab
+APP_NAME = "Personal Assistant"    # title on the login page, chat page and browser tab
 TAGLINE = "Upload your own documents and get answers grounded in sources. Private to you."
 GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_VISION_MODEL = "qwen/qwen3.8-27b"   # describes figures in uploaded PDFs
@@ -72,6 +74,7 @@ if st.session_state.get("_chat_owner") != user["id"]:      # new browser session
     st.session_state["messages"] = library.load_chat()       # bring back their last conversation
     st.session_state["attachments"], st.session_state["attached_names"] = [], []
     st.session_state["_chat_owner"] = user["id"]
+    st.session_state["chat_id"] = uuid.uuid4().hex[:8]
 st.session_state.setdefault("attachments", [])     # chunks of files attached in this chat
 st.session_state.setdefault("attached_names", [])
 
@@ -85,6 +88,7 @@ def save_chat():
 
 def new_chat():
     library.clear_chat()
+    st.session_state["chat_id"] = uuid.uuid4().hex[:8]          # fresh keys for the 👍/👎 widgets
     st.session_state["messages"] = []
     st.session_state["attachments"] = []
     st.session_state["attached_names"] = []
@@ -333,6 +337,35 @@ def show_sources(sources: list[dict], cited: list[int], queries: list[str] | Non
             st.caption(c["text"][:600] + ("…" if len(c["text"]) > 600 else ""))
 
 
+# =========================================================================== 👍 / 👎 feedback
+def _record_feedback(i: int, key: str) -> None:
+    """Called when the user clicks 👍 or 👎 under answer number i."""
+    messages = st.session_state["messages"]
+    msg, value = messages[i], st.session_state.get(key)
+    msg["feedback"] = value
+    if value is not None:
+        question = messages[i - 1]["content"] if i > 0 and messages[i - 1]["role"] == "user" else ""
+        try:
+            library.add_feedback({
+                "answer_id": msg.get("time") or f"{st.session_state['chat_id']}-{i}",
+                "time": _time.strftime("%Y-%m-%dT%H:%M:%S"), "rating": "up" if value == 1 else "down",
+                "question": question, "answer": msg["content"][:2000], "queries": msg.get("queries", []),
+                "sources": [{"source": c["source"], "page": c.get("page"), "cited": n in msg.get("cited", []),
+                             "text": "(attached file, not saved)" if c.get("attached") else c["text"][:400]}
+                            for n, c in enumerate(msg.get("sources", []), start=1)]})
+        except Exception as e:
+            st.toast(f"Couldn't save your rating: {e}", icon="⚠️")
+    save_chat()
+
+
+def feedback_widget(i: int) -> None:
+    msg = st.session_state["messages"][i]
+    if not msg.get("sources"):                 # only document answers are rated, not small talk
+        return
+    key = f"fb-{st.session_state['chat_id']}-{i}"
+    st.feedback("thumbs", key=key, default=msg.get("feedback"), on_change=_record_feedback, args=(i, key))
+
+
 # =========================================================================== delete confirmation
 @st.dialog("Delete document?", icon="⚠️")
 def confirm_delete(name: str, n_chunks: int) -> None:
@@ -354,6 +387,8 @@ def confirm_delete(name: str, n_chunks: int) -> None:
 docs = library.documents()
 
 with st.sidebar:
+    view = st.segmented_control("View", ["💬 Chat", "📊 Evaluation"], default="💬 Chat", key="view",
+                                label_visibility="collapsed") or "💬 Chat"
     st.header("📁 My documents")
     st.caption("Private to you: other users can't see or search these files.")
     st.caption(f"Limits: {MAX_DOCUMENTS} documents · {MAX_LIBRARY_FILE_MB} MB per file · "
@@ -440,6 +475,18 @@ with st.sidebar:
     st.caption(f"LLM: {llm}")
 
 
+# =========================================================================== evaluation page
+if view == "📊 Evaluation":
+    import eval_page
+
+    def _answer_for_eval(question, passages):
+        return "".join(stream_answer(question, passages))
+
+    eval_page.render(library, settings, llm_complete,
+                     plan_fn=lambda q: plan(q, False, llm_complete)[1], answer_fn=_answer_for_eval)
+    st.stop()
+
+
 # =========================================================================== 3. header
 st.title(f"🔎 {APP_NAME}")
 who_col, b1, b2 = st.columns([4, 1, 1], vertical_alignment="center")
@@ -478,13 +525,14 @@ if not messages:
             st.caption("Your library is empty. Add documents in the sidebar (they stay private to you), "
                        "or attach a file here with 📎 for this chat only.")
 
-for msg in messages:
+for i, msg in enumerate(messages):
     with st.chat_message(msg["role"]):
         st.markdown(md_safe(msg["content"]))
         if msg["role"] == "assistant":
             show_figures(msg.get("figures", []))
             show_privacy_note(msg.get("hidden", 0))
             show_sources(msg.get("sources", []), msg.get("cited", []), msg.get("queries"))
+            feedback_widget(i)
 
 submission = st.chat_input("Ask a question, or attach files with 📎…", accept_file=ATTACH_MODE,
                            file_type=["pdf", "md", "txt"], max_upload_size=MAX_FILE_MB)
@@ -515,7 +563,8 @@ if submission:
     with st.chat_message("user"):
         st.markdown(md_safe(user_text))
 
-    with st.chat_message("assistant"):
+    answer_box = st.chat_message("assistant")
+    with answer_box:
         for p in problems:
             st.warning(p)
         chunks, cited, hidden, figures, search_queries = [], [], 0, [], []
@@ -562,7 +611,9 @@ if submission:
                 st.error(text)
 
     messages.append({"role": "assistant", "content": text, "sources": chunks, "cited": cited, "hidden": hidden,
-                     "figures": figures, "queries": search_queries})
-    save_chat()                   # so a page refresh brings the conversation back
+                     "figures": figures, "queries": search_queries, "time": _time.strftime("%Y%m%d%H%M%S") + uuid.uuid4().hex[:4]})
+    save_chat()
+    with answer_box:
+        feedback_widget(len(messages) - 1)                   # so a page refresh brings the conversation back
     if read_ok:
         st.rerun()                # redraw so the "📎 In this chat only" banner appears right away

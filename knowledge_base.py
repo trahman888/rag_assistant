@@ -7,6 +7,8 @@ ONE LIBRARY PER USER (class Library)
                     <user_id>/_images/<doc_id>/p2_1.png   (figures + index.json)
                     <user_id>/_settings.json              (that user's Top K)
                     <user_id>/_chat.json                  (their current conversation)
+                    <user_id>/_feedback.json              (their 👍/👎 on answers)
+                    <user_id>/_eval.json, _eval_runs.json (their test questions + results)
                 Supabase's security rules only let a logged-in user touch the
                 folder named after their own id (see SETUP_SUPABASE.md).
                 Local mode: user_data/<user>/docs/ on this computer.
@@ -63,6 +65,8 @@ MAX_FIGURES_PER_PDF = 10    # figures described per PDF (each one uses the visio
 DEFAULT_SETTINGS = {"top_k": 4}
 SETTINGS_FILE = "_settings.json"
 CHAT_FILE = "_chat.json"
+FEEDBACK_FILE = "_feedback.json"
+MAX_FEEDBACK = 500
 MAX_SAVED_MESSAGES = 60     # older messages of a very long chat are not kept
 
 
@@ -386,6 +390,36 @@ class Library:
         except Exception:
             pass
 
+    # ------------------------------------------------------------------ small JSON files (feedback, evaluation)
+    def load_json(self, name: str, default):
+        try:
+            return json.loads(self.files.download(name))
+        except Exception:
+            return default
+
+    def save_json(self, name: str, data) -> None:
+        self.files.upload(name, json.dumps(data, indent=1, default=float).encode())
+
+    def add_feedback(self, record: dict) -> None:
+        """Append one 👍/👎 (with the question, answer and passages) to _feedback.json."""
+        items = self.load_json(FEEDBACK_FILE, [])
+        items.append(record)
+        self.save_json(FEEDBACK_FILE, items[-MAX_FEEDBACK:])
+
+    def chunk_samples(self, n: int, seed: int | None = None) -> list[dict]:
+        """n random text chunks (not figures) with enough text to ask a question about."""
+        import random
+        kw = self._keyword_index()
+        def looks_like_references(text):          # bibliography chunks make useless test questions
+            return len(re.findall(r"\b(?:19|20)\d{2}\b", text)) >= 4 or text.lower().count("et al") >= 2 \
+                or len(re.findall(r"\b[A-Z]\.,", text)) >= 4
+
+        pool = [i for i, (d, m) in enumerate(zip(kw["docs"], kw["metas"]))
+                if m.get("kind") != "image" and len(d) > 300 and not looks_like_references(d)]
+        random.Random(seed).shuffle(pool)
+        return [{"text": kw["docs"][i], "source": kw["metas"][i]["source"], "page": kw["metas"][i].get("page") or None}
+                for i in pool[:n]]
+
     # ------------------------------------------------------------------ search
     def _keyword_index(self) -> dict:
         with _lock:
@@ -399,7 +433,8 @@ class Library:
                 _kw_cache[self.key] = cached
             return cached
 
-    def _hybrid_rank(self, queries: list[str]) -> list[tuple[str, float]]:
+    def _hybrid_rank(self, queries: list[str], mode: str = "hybrid") -> list[tuple[str, float]]:
+        """mode: "hybrid" (vectors + keywords), "vector" or "keyword" (used by the evaluation page)."""
         n = self.collection.count()
         if not n:
             return []
@@ -411,7 +446,10 @@ class Library:
                 fused[cid] = fused.get(cid, 0.0) + 1.0 / (RRF_K + rank)
 
         for q in queries:
-            add(self.collection.query(query_embeddings=[embed_query(q)], n_results=min(POOL, n))["ids"][0])
+            if mode in ("hybrid", "vector"):
+                add(self.collection.query(query_embeddings=[embed_query(q)], n_results=min(POOL, n))["ids"][0])
+            if mode == "vector":
+                continue
             s = kw["bm25"].scores(tokenize(q))
             add([kw["ids"][i] for i in sorted((i for i in range(len(s)) if s[i] > 0), key=lambda i: -s[i])[:POOL]])
         return sorted(fused.items(), key=lambda kv: -kv[1])
@@ -443,13 +481,13 @@ class Library:
             return []
 
     def search(self, question: str, attachments: list[dict] | None = None, k: int = 4,
-               queries: list[str] | None = None) -> list[dict]:
+               queries: list[str] | None = None, mode: str = "hybrid") -> list[dict]:
         """The passages to answer from — ONLY from this user's library (+ their chat attachments)."""
         attachments = attachments or []
         all_queries = list(dict.fromkeys([question] + [q for q in (queries or []) if q and q.strip()]))[:4]
 
         figures = self._named_figures(all_queries)
-        ranked = self._hybrid_rank(all_queries)
+        ranked = self._hybrid_rank(all_queries, mode)
         if not figures and _WANTS_PICTURE.search(question or "") and ranked:
             figures = self._best_figure(all_queries, ranked)
         taken = {f["image"] for f in figures}
