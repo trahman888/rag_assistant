@@ -7,7 +7,7 @@ import streamlit as st
 
 from evaluation import (EVAL_FILE, MAX_RUNS, MODES, RUNS_FILE, checkable, clean_case, evaluate,
                         generate_cases)
-from knowledge_base import FEEDBACK_FILE
+from knowledge_base import SESSION_FEEDBACK_FILE
 
 COLUMNS = ["question", "expected_text", "document", "page", "in_documents", "origin"]
 
@@ -16,32 +16,25 @@ def _pct(x) -> str:
     return "–" if x is None else f"{x * 100:.0f}%"
 
 
-def _latest_feedback(items: list[dict]) -> list[dict]:
-    """One rating per answer (the user may have changed their mind)."""
-    by_id = {}
-    for f in items:
-        by_id[f.get("answer_id") or id(f)] = f
-    return [f for f in by_id.values() if f.get("rating") in ("up", "down")]
-
-
 def render(library, settings: dict, llm_complete, plan_fn, answer_fn) -> None:
     st.title("📊 Evaluation")
     st.caption("Measure how well the assistant finds and cites the right passages in **your** documents. "
-               "Results are private to you.")
+               "Test questions and results are private to you and are cleared when you log out; "
+               "only the 👍 / 👎 counts are kept.")
 
     docs = [d["source"] for d in library.documents()]
     cases = [c for c in (clean_case(c) for c in library.load_json(EVAL_FILE, [])) if c]
-    feedback = _latest_feedback(library.load_json(FEEDBACK_FILE, []))
+    counts = library.feedback_counts()                                   # all time
+    rated = library.load_json(SESSION_FEEDBACK_FILE, [])                  # answers rated since logging in
 
     # ------------------------------------------------------------------ 1. feedback
     st.subheader("👍 👎 Feedback on answers")
-    up = sum(f["rating"] == "up" for f in feedback)
-    down = len(feedback) - up
+    up, down = counts["up"], counts["down"]
     a, b, c = st.columns(3)
     a.metric("👍 Helpful", up)
     b.metric("👎 Not helpful", down)
-    c.metric("Satisfaction", _pct(up / len(feedback)) if feedback else "–")
-    bad = [f for f in reversed(feedback) if f["rating"] == "down"]
+    c.metric("Satisfaction", _pct(up / (up + down)) if up + down else "–")
+    bad = [f for f in reversed(rated) if f.get("rating") == "down"]
     if bad:
         with st.expander(f"Review 👎 answers ({len(bad)})"):
             st.caption("Turn a bad answer into a test question, so you can check whether a change fixes it.")
@@ -60,7 +53,7 @@ def render(library, settings: dict, llm_complete, plan_fn, answer_fn) -> None:
                     st.toast("Added. Fill in the expected text below.", icon="➕")
                     st.rerun()
                 st.divider()
-    elif not feedback:
+    elif not up + down:
         st.caption("No ratings yet. Use 👍 / 👎 under answers in the chat.")
 
     # ------------------------------------------------------------------ 2. test set

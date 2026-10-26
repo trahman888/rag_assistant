@@ -41,7 +41,7 @@ from images import load_image
 from knowledge_base import (MAX_DOCUMENTS, MAX_FIGURES_PER_PDF, LimitError, Library, read_attachment)
 from knowledge_base import MAX_FILE_MB as MAX_LIBRARY_FILE_MB
 
-APP_NAME = "Document Assistant"    # title on the login page, chat page and browser tab
+APP_NAME = "Personal Assistant"    # title on the login page, chat page and browser tab
 TAGLINE = "Upload your own documents and get answers grounded in sources. Private to you."
 GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_VISION_MODEL = "qwen/qwen3.8-27b"   # describes figures in uploaded PDFs
@@ -77,6 +77,7 @@ if st.session_state.get("_chat_owner") != user["id"]:      # first page load of 
         # start a new chat; the previous one is kept for "Continue last conversation".
         try:
             st.session_state["_last_chat"] = library.archive_chat() or library.load_last_chat()
+            library.clear_session_data()        # evaluation questions/results are for one login only
         except Exception:
             pass
         st.session_state["messages"] = []
@@ -355,13 +356,14 @@ def _record_feedback(i: int, key: str) -> None:
     """Called when the user clicks 👍 or 👎 under answer number i."""
     messages = st.session_state["messages"]
     msg, value = messages[i], st.session_state.get(key)
+    old = msg.get("feedback")
     msg["feedback"] = value
-    if value is not None:
+    if value != old:
         question = messages[i - 1]["content"] if i > 0 and messages[i - 1]["role"] == "user" else ""
         try:
-            library.add_feedback({
+            library.record_feedback(old, value, {
                 "answer_id": msg.get("time") or f"{st.session_state['chat_id']}-{i}",
-                "time": _time.strftime("%Y-%m-%dT%H:%M:%S"), "rating": "up" if value == 1 else "down",
+                "time": _time.strftime("%Y-%m-%dT%H:%M:%S"), "rating": {1: "up", 0: "down"}.get(value),
                 "question": question, "answer": msg["content"][:2000], "queries": msg.get("queries", []),
                 "sources": [{"source": c["source"], "page": c.get("page"), "cited": n in msg.get("cited", []),
                              "text": "(attached file, not saved)" if c.get("attached") else c["text"][:400]}

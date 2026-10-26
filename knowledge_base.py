@@ -8,8 +8,9 @@ ONE LIBRARY PER USER (class Library)
                     <user_id>/_settings.json              (that user's Top K)
                     <user_id>/_chat.json                  (their current conversation)
                     <user_id>/_last_chat.json             (the one before, for "Continue last conversation")
-                    <user_id>/_feedback.json              (their 👍/👎 on answers)
-                    <user_id>/_eval.json, _eval_runs.json (their test questions + results)
+                    <user_id>/_feedback.json              (just the number of 👍 and 👎, kept)
+                    <user_id>/_session_feedback.json,     (rated answers, test questions and results:
+                    _eval.json, _eval_runs.json            kept only until the user logs out)
                 Supabase's security rules only let a logged-in user touch the
                 folder named after their own id (see SETUP_SUPABASE.md).
                 Local mode: user_data/<user>/docs/ on this computer.
@@ -69,8 +70,10 @@ DEFAULT_SETTINGS = {"top_k": 4}
 SETTINGS_FILE = "_settings.json"
 CHAT_FILE = "_chat.json"
 LAST_CHAT_FILE = "_last_chat.json"
-FEEDBACK_FILE = "_feedback.json"
-MAX_FEEDBACK = 500
+FEEDBACK_FILE = "_feedback.json"                  # {"up": 12, "down": 3} — kept permanently
+SESSION_FEEDBACK_FILE = "_session_feedback.json"  # rated answers, for "Review 👎 answers" — this login only
+SESSION_FILES = (SESSION_FEEDBACK_FILE, "_eval.json", "_eval_runs.json")   # deleted at every new login
+MAX_FEEDBACK = 200
 MAX_SAVED_MESSAGES = 60     # older messages of a very long chat are not kept
 
 
@@ -446,11 +449,37 @@ class Library:
     def save_json(self, name: str, data) -> None:
         self.files.upload(name, json.dumps(data, indent=1, default=float).encode())
 
-    def add_feedback(self, record: dict) -> None:
-        """Append one 👍/👎 (with the question, answer and passages) to _feedback.json."""
-        items = self.load_json(FEEDBACK_FILE, [])
-        items.append(record)
-        self.save_json(FEEDBACK_FILE, items[-MAX_FEEDBACK:])
+    def feedback_counts(self) -> dict:
+        data = self.load_json(FEEDBACK_FILE, {})
+        if isinstance(data, list):                      # older versions stored every rating: count them
+            latest = {}
+            for f in data:
+                latest[f.get("answer_id") or id(f)] = f.get("rating")
+            data = {"up": sum(r == "up" for r in latest.values()), "down": sum(r == "down" for r in latest.values())}
+        return {"up": int(data.get("up", 0)), "down": int(data.get("down", 0))}
+
+    def record_feedback(self, old: int | None, new: int | None, record: dict) -> None:
+        """A 👍 (1) / 👎 (0) was set, changed or removed on one answer.
+        The permanent counts are adjusted; the answer itself is kept only for this login."""
+        counts = self.feedback_counts()
+        for value, step in ((old, -1), (new, +1)):
+            if value is not None:
+                name = "up" if value == 1 else "down"
+                counts[name] = max(0, counts[name] + step)
+        self.save_json(FEEDBACK_FILE, counts)
+        items = [f for f in self.load_json(SESSION_FEEDBACK_FILE, []) if f.get("answer_id") != record["answer_id"]]
+        if new is not None:
+            items.append(record)
+        self.save_json(SESSION_FEEDBACK_FILE, items[-MAX_FEEDBACK:])
+
+    def clear_session_data(self) -> None:
+        """New login: forget test questions, evaluation results and the rated-answer list
+        (the 👍/👎 counts stay)."""
+        for name in SESSION_FILES:
+            try:
+                self.files.delete(name)
+            except Exception:
+                pass
 
     def chunk_samples(self, n: int, seed: int | None = None) -> list[dict]:
         """n random text chunks (not figures) with enough text to ask a question about."""
