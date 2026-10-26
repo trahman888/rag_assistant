@@ -399,6 +399,35 @@ def confirm_delete(name: str, n_chunks: int) -> None:
 docs = library.documents()
 
 with st.sidebar:
+    # ---- account + conversation controls
+    who_col, out_col = st.columns([3, 2], vertical_alignment="center")
+    with who_col.popover(f"👤 {display_name(user)}", use_container_width=True):
+        st.caption(f"Signed in as {user['email']}")
+        with st.form("rename", clear_on_submit=True, border=False):
+            new_name = st.text_input("Your name", placeholder=display_name(user), max_chars=60)
+            if st.form_submit_button("Save name"):
+                try:
+                    update_name(new_name)
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+    if out_col.button("Log out", use_container_width=True):
+        log_out()
+        st.rerun()
+
+    if st.button("➕ New chat", use_container_width=True):
+        new_chat()
+        st.rerun()
+    if not st.session_state["messages"]:                    # offered while the current chat is still empty
+        if "_last_chat" not in st.session_state:            # look it up once per session
+            st.session_state["_last_chat"] = library.load_last_chat()
+        if st.session_state["_last_chat"] and st.button("↩️ Continue last conversation", use_container_width=True,
+                                                        help="Bring back your previous chat"):
+            st.session_state["messages"] = library.resume_last_chat()
+            st.session_state["_last_chat"] = []
+            st.rerun()
+    st.divider()
+
     view = st.segmented_control("View", ["💬 Chat", "📊 Evaluation"], default="💬 Chat", key="view",
                                 label_visibility="collapsed") or "💬 Chat"
     st.header("📁 My documents")
@@ -502,23 +531,6 @@ if view == "📊 Evaluation":
 
 # =========================================================================== 3. header
 st.title(f"🔎 {APP_NAME}")
-who_col, b1, b2 = st.columns([4, 1, 1], vertical_alignment="center")
-with who_col.popover(f"👤 {display_name(user)}"):
-    st.caption(f"Signed in as {user['email']}")
-    with st.form("rename", clear_on_submit=True, border=False):
-        new_name = st.text_input("Your name", placeholder=display_name(user), max_chars=60)
-        if st.form_submit_button("Save name"):
-            try:
-                update_name(new_name)
-                st.rerun()
-            except Exception as e:
-                st.error(str(e))
-if b1.button("New chat", use_container_width=True):
-    new_chat()
-    st.rerun()
-if b2.button("Log out", use_container_width=True):
-    log_out()
-    st.rerun()
 
 if st.session_state["attached_names"]:
     a, b = st.columns([4, 1], vertical_alignment="center")
@@ -534,18 +546,6 @@ first_name = display_name(user).split()[0]
 if not messages:
     with st.chat_message("assistant"):
         st.markdown(f"Hi {first_name}! How can I help you today?")
-        if "_last_chat" not in st.session_state:                    # look it up once per session
-            st.session_state["_last_chat"] = library.load_last_chat()
-        last_chat = st.session_state["_last_chat"]
-        if last_chat:
-            first_q = next((m["content"] for m in last_chat if m["role"] == "user"), "")
-            first_q = first_q.split("\n")[0][:70] + ("…" if len(first_q) > 70 else "")
-            asked = sum(m["role"] == "user" for m in last_chat)
-            if st.button("↩️ Continue last conversation", help="Bring back your previous chat"):
-                st.session_state["messages"] = library.resume_last_chat()
-                st.session_state["_last_chat"] = []
-                st.rerun()
-            st.caption(f"{asked} question{'s' if asked != 1 else ''}, starting with “{md_safe(first_q)}”")
         if not docs:
             st.caption("Your library is empty. Add documents in the sidebar (they stay private to you), "
                        "or attach a file here with 📎 for this chat only.")
