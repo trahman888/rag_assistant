@@ -8,7 +8,7 @@ WHY
     routing, privacy masking and citations then work for figures automatically,
     and the Sources box can show the picture itself.
 
-PIPELINE (admin upload, runs once per PDF)
+PIPELINE (when a user uploads a PDF, runs once per PDF)
     1. extract_images()   PyMuPDF finds each figure's AREA on the page (placed
                           pictures + drawn charts/diagrams/tables), merges pieces
                           that belong together, adds nearby axis labels, finds
@@ -73,7 +73,7 @@ If the image is purely decorative (logo, border, background, icon), reply with e
 
 
 # =========================================================================== 1. find figures on the page
-def extract_images(pdf_path: Path) -> list[dict]:
+def extract_images(pdf_path: Path, max_images: int = MAX_IMAGES) -> list[dict]:
     """Figures as they LOOK on the page: [{"page", "png", "width", "height", "context", "caption"}].
 
     Why not just take the images stored inside the PDF? Because what's stored
@@ -100,7 +100,7 @@ def extract_images(pdf_path: Path) -> list[dict]:
                 seen.add(digest)
                 found.append({"page": page.number + 1, "png": png, "width": pix.width, "height": pix.height,
                               "context": page_text, "caption": caption})
-                if len(found) >= MAX_IMAGES:
+                if len(found) >= max_images:
                     return found
     return found
 
@@ -232,10 +232,10 @@ def _to_png(data: bytes) -> bytes:
 
 # =========================================================================== 2–4. describe, store, index
 def add_pdf_images(files, collection, pdf_path: Path, doc_id: str, source: str,
-                   describe_fn, progress=None, on_error=None) -> int:
+                   describe_fn, progress=None, on_error=None, max_images: int = MAX_IMAGES) -> int:
     """Run the whole pipeline for one PDF. Returns how many figures were added.
     describe_fn(png_bytes, prompt) -> str ; progress(done, total) is optional."""
-    images = extract_images(pdf_path)
+    images = extract_images(pdf_path, max_images)
     records = []
     for i, im in enumerate(images, start=1):
         if progress:
@@ -287,7 +287,7 @@ def restore_image_chunks(files, collection, doc_id: str, source: str) -> int:
 
 
 def delete_pdf_images(files, doc_id: str) -> None:
-    """Remove a document's stored figures (called when the admin deletes the PDF)."""
+    """Remove a document's stored figures (called when the user deletes the PDF)."""
     try:
         names = files.list_folder(f"{IMAGES_DIR}/{doc_id}")
     except Exception:

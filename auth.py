@@ -13,13 +13,9 @@ TWO MODES (picked automatically)
 WHAT THE REST OF THE APP GETS
     st.session_state["user"] = {"id": "...", "email": "...", "name": "..."}
     display_name(user) -> the name to show (falls back to the email for old accounts)
-    is_admin(user) -> True for emails listed in ADMIN_EMAILS (default below).
-
-ADMIN SAFETY
-    Admin rights come from the email address, so make sure the admin account
-    exists before anyone else can sign up with that address: create it first,
-    and keep Supabase "Confirm email" ON so nobody can claim an email they
-    don't own.
+    user["id"] names the user's private document folder (knowledge_base.Library).
+    Supabase's storage rules check that same id, so one user can never read
+    another user's files. Keep Supabase "Confirm email" ON.
 
 STAYING LOGGED IN AFTER A PAGE REFRESH
     A refresh starts a brand-new Streamlit session, and st.session_state starts
@@ -78,20 +74,6 @@ def supabase_client():
         base_url = f"{u.scheme}://{u.netloc}"            # tolerate /rest/v1/ or a trailing slash
         st.session_state["sb"] = create_client(base_url, _secret("SUPABASE_KEY").strip())
     return st.session_state["sb"]
-
-
-# --------------------------------------------------------------------------- admin
-DEFAULT_ADMINS = "tanzila.himu@gmail.com"
-
-
-def admin_emails() -> set[str]:
-    """Admins come from the ADMIN_EMAILS secret (comma-separated), else the default above."""
-    raw = _secret("ADMIN_EMAILS") or DEFAULT_ADMINS
-    return {e.strip().lower() for e in raw.split(",") if e.strip()}
-
-
-def is_admin(user: dict | None) -> bool:
-    return bool(user) and user["email"].lower() in admin_emails()
 
 
 # --------------------------------------------------------------------------- local mode

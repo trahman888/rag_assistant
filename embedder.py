@@ -1,5 +1,5 @@
 """
-The embedding model used for the shared knowledge base: BAAI/bge-small-en-v1.5.
+The embedding model used for every user's document library: BAAI/bge-small-en-v1.5.
 
 WHY THIS MODEL
     all-MiniLM-L6-v2 (2021) is tiny and fast but weak at paraphrases and

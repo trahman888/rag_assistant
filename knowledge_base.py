@@ -1,39 +1,42 @@
 """
-One shared knowledge base (admin-managed) + temporary chat attachments.
+Private document libraries: every user has their own, and nobody else can see or search it.
 
-SHARED KNOWLEDGE BASE  — only the admin can change it
-    Permanent:  Supabase Storage bucket "documents", folder "shared/"
-                (local mode: user_data/shared/uploads/)
-    Searchable: Chroma collection "shared_kb_<model>" on the server's disk,
-                one collection per embedding model (see embedder.py)
+ONE LIBRARY PER USER (class Library)
+    Permanent:  Supabase Storage bucket "documents", folder "<user_id>/"
+                    <user_id>/report.pdf
+                    <user_id>/_images/<doc_id>/p2_1.png   (figures + index.json)
+                    <user_id>/_settings.json              (that user's Top K)
+                Supabase's security rules only let a logged-in user touch the
+                folder named after their own id (see SETUP_SUPABASE.md).
+                Local mode: user_data/<user>/docs/ on this computer.
+    Searchable: that user's OWN Chroma collection "u_<user>_<model>".
+                search() only ever queries this one collection, so another
+                user's documents can never appear in your answers.
 
     The server's disk is wiped when Streamlit Cloud restarts, so the first
-    visitor after a restart (admin or not) triggers ensure_synced(): it
-    downloads shared/ and rebuilds the index once for the whole app.
-    Everyone after that shares the same ready index. The same thing happens
-    automatically after switching to a new embedding model.
+    time a user opens the app after a restart, Library.sync() downloads their
+    files and rebuilds their index (figures come back from their saved
+    descriptions, without calling the vision model again).
 
-HOW SEARCH WORKS (search())
-    1. Several queries: the user's question plus the 2–3 search phrases the
-       LLM rewrote it into (router.py). Each query is searched separately.
-    2. Hybrid retrieval, for every query:
-         * meaning search  — vectors from the embedding model (Chroma)
-         * keyword search  — BM25 over the same chunks: exact terms such as
-                             "RFQ", "FP4", "Wan2.2" or a person's name
-    3. Reciprocal Rank Fusion merges all those ranked lists into one: a chunk
-       that ranks well in several lists rises to the top. RRF only uses ranks,
-       so meaning scores and keyword scores never have to be compared directly.
-    4. Figures: "Figure 3" by number is looked up directly; "show me the …
+LIMITS (to keep the database from getting crowded)
+    MAX_DOCUMENTS per user, MAX_FILE_MB per file, MAX_FIGURES_PER_PDF.
+
+HOW SEARCH WORKS (Library.search())
+    1. Several queries: the question plus the 2–3 search phrases the LLM
+       rewrote it into (router.py).
+    2. Hybrid retrieval for every query: meaning search (vectors) + keyword
+       search (BM25), merged with Reciprocal Rank Fusion.
+    3. Figures: "Figure 3" by number is looked up directly; "show me the …
        figure/chart/diagram" makes sure the best-matching figure is included.
 
-CHAT ATTACHMENTS  — any user, this chat only, never saved
-    Files attached in the chat box are read, chunked and embedded in memory
-    and kept in that user's session (st.session_state). They come first in
-    search results, and disappear on logout, "New chat", or when the tab closes.
+CHAT ATTACHMENTS (📎) — this chat only, never saved
+    Read, chunked and embedded in memory; they come first in search results.
 
 USES FROM vector_store.py
     DB_DIR, file_id, extract_file, chunk_pages
 """
+import hashlib
+import json
 import math
 import re
 import tempfile
@@ -48,12 +51,23 @@ from embedder import collection_suffix, embed_passages, embed_query
 from vector_store import DB_DIR, chunk_pages, extract_file, file_id
 
 BUCKET = "documents"
-SHARED_PREFIX = "shared"
 SUPPORTED = {".pdf", ".md", ".txt"}
-SHARED_FOLDER = Path(__file__).parent / "user_data" / "shared" / "uploads"
+DATA_ROOT = Path(__file__).parent / "user_data"
+
+# ---- limits per user --------------------------------------------------------
+MAX_DOCUMENTS = 20          # documents in one user's library
+MAX_FILE_MB = 20            # size of one uploaded file
+MAX_FIGURES_PER_PDF = 10    # figures described per PDF (each one uses the vision model's free quota)
+
+DEFAULT_SETTINGS = {"top_k": 4}
+SETTINGS_FILE = "_settings.json"
 
 
-# =========================================================================== names
+class LimitError(ValueError):
+    """An upload that would go over the user's limits."""
+
+
+# =========================================================================== small helpers
 def safe_name(name: str) -> str:
     name = Path(name).name
     stem, suffix = Path(name).stem, Path(name).suffix.lower()
@@ -61,237 +75,76 @@ def safe_name(name: str) -> str:
     return f"{stem[:100]}{suffix}"
 
 
-# =========================================================================== shared vector db
+def _slug(user_id: str) -> str:
+    return hashlib.sha1(user_id.encode()).hexdigest()[:16]
+
+
 _client = None
 _client_lock = threading.Lock()
 
 
-def shared_collection():
-    """Open the vector database once per server. The lock stops two visitors who
-    arrive at the same moment from opening it twice at once (which Chroma rejects).
-    The collection name includes the embedding model, so vectors from different
-    models are never mixed."""
+def _chroma():
+    """One database client per server; the lock stops two visitors opening it at once."""
     global _client
     with _client_lock:
         if _client is None:
             _client = chromadb.PersistentClient(path=str(DB_DIR))
-        return _client.get_or_create_collection(
-            f"shared_kb_{collection_suffix()}", metadata={"hnsw:space": "cosine"}, embedding_function=None)
-
-
-def list_documents(collection) -> list[dict]:
-    docs = {}
-    for m in collection.get(include=["metadatas"])["metadatas"]:
-        d = docs.setdefault(m["doc_id"], {"doc_id": m["doc_id"], "source": m["source"], "chunks": 0, "figures": 0})
-        d["chunks"] += 1
-        if m.get("kind") == "image":
-            d["figures"] += 1
-    return sorted(docs.values(), key=lambda d: d["source"].lower())
-
-
-def index_document(path: Path, collection) -> int:
-    """Extract -> chunk -> embed (embedder.py) -> store one file. Returns chunks added (0 = already there)."""
-    doc_id = file_id(path)
-    if collection.get(where={"doc_id": doc_id}, limit=1)["ids"]:
-        return 0
-    chunks = chunk_pages(extract_file(path))
-    if not chunks:
-        return 0
-    collection.add(
-        ids=[f"{doc_id}-{c['chunk_no']}" for c in chunks],
-        embeddings=embed_passages([c["text"] for c in chunks]),
-        documents=[c["text"] for c in chunks],
-        metadatas=[{"doc_id": doc_id, "source": Path(path).name, "page": c["page"] or 0,
-                    "path": str(Path(path).resolve())} for c in chunks],
-    )
-    keyword_index_changed()
-    return len(chunks)
+        return _client
 
 
 # =========================================================================== permanent file storage
 class SupabaseFiles:
-    """Files in Supabase Storage under 'shared/'. Supabase's security rules let
-    every logged-in user READ them, but only the admin can add/replace/delete."""
+    """One user's files in Supabase Storage, all under the folder '<user_id>/'."""
 
-    def __init__(self, client):
+    def __init__(self, client, prefix: str):
         self.bucket = client.storage.from_(BUCKET)
+        self.prefix = prefix
 
     def names(self) -> list[str]:
-        items = self.bucket.list(SHARED_PREFIX, {"limit": 1000})
+        items = self.bucket.list(self.prefix, {"limit": 1000})
         return sorted(i["name"] for i in items if i.get("name") and not i["name"].startswith(".")
                       and Path(i["name"]).suffix.lower() in SUPPORTED)
 
     def upload(self, name: str, data: bytes) -> None:
         content_type = {"pdf": "application/pdf", "md": "text/markdown", "png": "image/png",
                         "json": "application/json"}.get(name.rsplit(".", 1)[-1].lower(), "text/plain")
-        self.bucket.upload(f"{SHARED_PREFIX}/{name}", data, {"content-type": content_type, "upsert": "true"})
+        self.bucket.upload(f"{self.prefix}/{name}", data, {"content-type": content_type, "upsert": "true"})
 
     def download(self, name: str) -> bytes:
-        return self.bucket.download(f"{SHARED_PREFIX}/{name}")
+        return self.bucket.download(f"{self.prefix}/{name}")
 
     def delete(self, name: str) -> None:
-        self.bucket.remove([f"{SHARED_PREFIX}/{name}"])
+        self.bucket.remove([f"{self.prefix}/{name}"])
 
     def list_folder(self, sub: str) -> list[str]:
-        """File names inside a sub-folder, e.g. '_images/<doc_id>'."""
-        items = self.bucket.list(f"{SHARED_PREFIX}/{sub}", {"limit": 1000})
+        items = self.bucket.list(f"{self.prefix}/{sub}", {"limit": 1000})
         return [i["name"] for i in items if i.get("name") and not i["name"].startswith(".")]
 
 
 class LocalFiles:
-    """Local mode: the shared folder on this computer is the permanent store."""
+    """Local mode: the user's folder on this computer is the permanent store."""
 
-    def __init__(self):
-        SHARED_FOLDER.mkdir(parents=True, exist_ok=True)
+    def __init__(self, folder: Path):
+        self.folder = folder
+        folder.mkdir(parents=True, exist_ok=True)
 
     def names(self) -> list[str]:
-        return sorted(p.name for p in SHARED_FOLDER.iterdir() if p.suffix.lower() in SUPPORTED)
+        return sorted(p.name for p in self.folder.iterdir() if p.suffix.lower() in SUPPORTED)
 
     def upload(self, name: str, data: bytes) -> None:
-        target = SHARED_FOLDER / name
-        target.parent.mkdir(parents=True, exist_ok=True)      # e.g. _images/<doc_id>/
+        target = self.folder / name
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
 
     def download(self, name: str) -> bytes:
-        return (SHARED_FOLDER / name).read_bytes()
+        return (self.folder / name).read_bytes()
 
     def delete(self, name: str) -> None:
-        (SHARED_FOLDER / name).unlink(missing_ok=True)
+        (self.folder / name).unlink(missing_ok=True)
 
     def list_folder(self, sub: str) -> list[str]:
-        folder = SHARED_FOLDER / sub
-        return [p.name for p in folder.iterdir() if p.is_file()] if folder.is_dir() else []
-
-
-# =========================================================================== admin operations
-def add_document(files, collection, name: str, data: bytes, describe_fn=None, progress=None,
-                 on_error=None) -> tuple[int, int]:
-    """Save + index one document. For PDFs, describe_fn (a vision model) also turns
-    the PDF's images into searchable figure chunks. Returns (text_chunks, figures)."""
-    from images import add_pdf_images, delete_pdf_images
-
-    SHARED_FOLDER.mkdir(parents=True, exist_ok=True)
-    name = safe_name(name)
-    path = SHARED_FOLDER / name
-    if path.exists() and path.read_bytes() != data:          # new version of an existing file
-        old_id = file_id(path)
-        collection.delete(where={"doc_id": old_id})
-        delete_pdf_images(files, old_id)
-        keyword_index_changed()
-    files.upload(name, data)
-    path.write_bytes(data)
-    chunks = index_document(path, collection)
-    figures = 0
-    if chunks and describe_fn and path.suffix.lower() == ".pdf":
-        figures = add_pdf_images(files, collection, path, file_id(path), name, describe_fn, progress, on_error)
-        keyword_index_changed()
-    return chunks, figures
-
-
-def delete_document(files, collection, name: str) -> None:
-    """Remove a document everywhere: storage, its figures, and all its chunks."""
-    from images import delete_pdf_images
-
-    doc_ids = {m["doc_id"] for m in collection.get(where={"source": name}, include=["metadatas"])["metadatas"]}
-    files.delete(name)
-    path = SHARED_FOLDER / name
-    if path.exists():
-        doc_ids.add(file_id(path))
-        path.unlink()
-    for doc_id in doc_ids:
-        delete_pdf_images(files, doc_id)
-        collection.delete(where={"doc_id": doc_id})
-    collection.delete(where={"source": name})
-    keyword_index_changed()
-
-
-# =========================================================================== app settings (admin)
-SETTINGS_FILE = "_settings.json"          # stored next to the documents, so it survives restarts
-DEFAULT_SETTINGS = {"sources_per_answer": 4}
-_settings_lock = threading.Lock()
-_settings: dict | None = None
-
-
-def get_settings(files) -> dict:
-    """App-wide settings chosen by the admin (read once per server, then cached)."""
-    global _settings
-    with _settings_lock:
-        if _settings is None:
-            import json
-            try:
-                saved = json.loads(files.download(SETTINGS_FILE))
-            except Exception:
-                saved = {}                        # nothing saved yet: use the defaults
-            _settings = {**DEFAULT_SETTINGS, **{k: v for k, v in saved.items() if k in DEFAULT_SETTINGS}}
-        return dict(_settings)
-
-
-def save_setting(files, key: str, value) -> None:
-    """Change one setting for everyone and save it permanently (admin only: storage rules enforce it)."""
-    import json
-    global _settings
-    current = get_settings(files)
-    current[key] = value
-    files.upload(SETTINGS_FILE, json.dumps(current, indent=2).encode())
-    with _settings_lock:
-        _settings = current
-
-
-# =========================================================================== sync after restart
-_sync_lock = threading.Lock()
-_synced = False
-
-
-def ensure_synced(files, collection, force: bool = False) -> dict | None:
-    """Rebuild the shared index from permanent storage — once per server process
-    (or again when the admin presses Reload). Safe if several users arrive at once."""
-    global _synced
-    with _sync_lock:
-        if _synced and not force:
-            return None
-        SHARED_FOLDER.mkdir(parents=True, exist_ok=True)
-        report = {"downloaded": 0, "indexed": 0, "removed": 0}
-        wanted = set(files.names())
-        present_ids = set()
-        for name in sorted(wanted):
-            path = SHARED_FOLDER / name
-            if not path.exists():
-                path.write_bytes(files.download(name))
-                report["downloaded"] += 1
-            doc_id = file_id(path)
-            present_ids.add(doc_id)
-            if index_document(path, collection):
-                report["indexed"] += 1
-                if path.suffix.lower() == ".pdf":         # bring back its figures (no vision calls)
-                    from images import restore_image_chunks
-                    restore_image_chunks(files, collection, doc_id, name)
-        for d in list_documents(collection):
-            if d["doc_id"] not in present_ids:
-                collection.delete(where={"doc_id": d["doc_id"]})
-                report["removed"] += 1
-        for p in SHARED_FOLDER.iterdir():
-            if p.is_file() and p.suffix.lower() in SUPPORTED and p.name not in wanted:
-                p.unlink()
-        keyword_index_changed()
-        _synced = True
-        return report
-
-
-# =========================================================================== temporary attachments
-def read_attachment(name: str, data: bytes) -> list[dict]:
-    """Parse + chunk + embed one attached file entirely in memory/temp. Not saved anywhere."""
-    name = safe_name(name)
-    if Path(name).suffix.lower() not in SUPPORTED:
-        raise ValueError(f"{name}: only PDF, Markdown and text files are supported")
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / name
-        path.write_bytes(data)
-        chunks = chunk_pages(extract_file(path))
-    if not chunks:
-        raise ValueError(f"{name}: no readable text (scanned PDF?)")
-    vectors = np.array(embed_passages([c["text"] for c in chunks]), dtype=np.float32)
-    return [{"text": c["text"], "source": name, "page": c["page"], "attached": True, "vector": v}
-            for c, v in zip(chunks, vectors)]
+        f = self.folder / sub
+        return [p.name for p in f.iterdir() if p.is_file()] if f.is_dir() else []
 
 
 # =========================================================================== keyword search (BM25)
@@ -306,9 +159,8 @@ def tokenize(text: str) -> list[str]:
 
 
 class BM25:
-    """Classic keyword ranking: a chunk scores higher for containing the query's
-    words, especially RARE words (idf), with diminishing returns for repeats (k1)
-    and a correction for long chunks (b)."""
+    """Keyword ranking: rewards a chunk for containing the query's words, especially
+    RARE words (idf), with diminishing returns for repeats (k1) and a length correction (b)."""
 
     def __init__(self, docs: list[list[str]], k1: float = 1.5, b: float = 0.75):
         self.tfs = [Counter(d) for d in docs]
@@ -332,34 +184,20 @@ class BM25:
         return out
 
 
-_kw_lock = threading.Lock()
-_kw_cache = {"version": -1}
-_kw_version = 0
+# Caches shared by everyone on this server, keyed by the user's collection name.
+_kw_cache: dict[str, dict] = {}       # keyword index per library
+_kw_version: dict[str, int] = {}      # bumped on every add/delete
+_synced: set[str] = set()             # libraries already rebuilt since this server started
+_settings_cache: dict[str, dict] = {}
+_lock = threading.RLock()
 
 
-def keyword_index_changed() -> None:
-    """Call after any add/delete so the keyword index is rebuilt on the next search."""
-    global _kw_version
-    _kw_version += 1
-
-
-def _keyword_index(collection):
-    """All chunks + a BM25 index over them, built once and reused until the data changes."""
-    with _kw_lock:
-        if _kw_cache["version"] != (_kw_version, collection.count()):
-            got = collection.get(include=["documents", "metadatas"])
-            _kw_cache.update(version=(_kw_version, collection.count()), ids=got["ids"], docs=got["documents"],
-                             metas=got["metadatas"], bm25=BM25([tokenize(d) for d in got["documents"]]),
-                             pos={cid: i for i, cid in enumerate(got["ids"])})
-        return _kw_cache
-
-
-# =========================================================================== hybrid search
+# =========================================================================== search constants
 RRF_K = 60                 # standard Reciprocal Rank Fusion constant
 POOL = 20                  # candidates taken from each ranked list before fusing
 ATTACH_WHOLE_LIMIT = 8     # attachments this small (in chunks) are sent to the LLM in full
 ATTACH_TOP = 6             # otherwise: this many best-matching attachment chunks
-KB_WITH_ATTACH = 2         # knowledge-base chunks allowed alongside attachments
+LIB_WITH_ATTACH = 2        # library chunks allowed alongside attachments
 
 _FIGURE_REF = re.compile(r"\b(fig(?:ure)?s?\.?|tables?)\s*((?:\d+(?:\s*(?:,|and|&|or|-)\s*)?)+)", re.IGNORECASE)
 _WANTS_PICTURE = re.compile(r"\b(figures?|figs?|charts?|graphs?|plots?|diagrams?|images?|pictures?|photos?|"
@@ -371,106 +209,261 @@ def _hit(text: str, meta: dict, score: float) -> dict:
             "attached": False, "image": meta.get("image"), "caption": meta.get("caption", "")}
 
 
-def hybrid_rank(collection, queries: list[str]) -> list[tuple[str, float]]:
-    """Meaning search + keyword search for every query, fused with RRF.
-    Returns [(chunk_id, fused_score)] best first."""
-    n = collection.count()
-    if not n:
-        return []
-    kw = _keyword_index(collection)
-    fused: dict[str, float] = {}
+# =========================================================================== the library
+class Library:
+    """Everything belonging to ONE user: their files, their vector collection,
+    their keyword index, their figures and their settings."""
 
-    def add(ranked_ids):
-        for rank, cid in enumerate(ranked_ids, start=1):
-            fused[cid] = fused.get(cid, 0.0) + 1.0 / (RRF_K + rank)
+    def __init__(self, user: dict, supabase_client=None):
+        slug = _slug(user["id"])
+        self.folder = DATA_ROOT / slug / "docs"                       # local copies (cache on Streamlit Cloud)
+        self.folder.mkdir(parents=True, exist_ok=True)
+        self.files = (SupabaseFiles(supabase_client, user["id"]) if supabase_client is not None
+                      else LocalFiles(self.folder))
+        self.collection = _chroma().get_or_create_collection(
+            f"u_{slug}_{collection_suffix()}"[:63], metadata={"hnsw:space": "cosine"}, embedding_function=None)
+        self.key = self.collection.name
 
-    for q in queries:
-        dense = collection.query(query_embeddings=[embed_query(q)], n_results=min(POOL, n))
-        add(dense["ids"][0])
-        s = kw["bm25"].scores(tokenize(q))
-        top = sorted((i for i in range(len(s)) if s[i] > 0), key=lambda i: -s[i])[:POOL]
-        add([kw["ids"][i] for i in top])
-    return sorted(fused.items(), key=lambda kv: -kv[1])
+    # ------------------------------------------------------------------ contents
+    def documents(self) -> list[dict]:
+        docs = {}
+        for m in self.collection.get(include=["metadatas"])["metadatas"]:
+            d = docs.setdefault(m["doc_id"], {"doc_id": m["doc_id"], "source": m["source"], "chunks": 0, "figures": 0})
+            d["chunks"] += 1
+            if m.get("kind") == "image":
+                d["figures"] += 1
+        return sorted(docs.values(), key=lambda d: d["source"].lower())
+
+    def _changed(self) -> None:
+        with _lock:
+            _kw_version[self.key] = _kw_version.get(self.key, 0) + 1
+
+    def _index_text(self, path: Path) -> int:
+        doc_id = file_id(path)
+        if self.collection.get(where={"doc_id": doc_id}, limit=1)["ids"]:
+            return 0
+        chunks = chunk_pages(extract_file(path))
+        if not chunks:
+            return 0
+        self.collection.add(
+            ids=[f"{doc_id}-{c['chunk_no']}" for c in chunks],
+            embeddings=embed_passages([c["text"] for c in chunks]),
+            documents=[c["text"] for c in chunks],
+            metadatas=[{"doc_id": doc_id, "source": path.name, "page": c["page"] or 0, "path": str(path.resolve())}
+                       for c in chunks],
+        )
+        self._changed()
+        return len(chunks)
+
+    # ------------------------------------------------------------------ add / delete
+    def check_limits(self, name: str, size_bytes: int) -> None:
+        """Raise LimitError if this upload would go over the user's limits."""
+        if size_bytes > MAX_FILE_MB * 1024 * 1024:
+            raise LimitError(f"{name} is {size_bytes / 1024 / 1024:.1f} MB; the limit is {MAX_FILE_MB} MB per file.")
+        current = {d["source"] for d in self.documents()}
+        if safe_name(name) not in current and len(current) >= MAX_DOCUMENTS:
+            raise LimitError(f"Your library is full ({MAX_DOCUMENTS} documents). Delete one to add {name}.")
+
+    def add(self, name: str, data: bytes, describe_fn=None, progress=None, on_error=None) -> tuple[int, int]:
+        """Save + index one document. For PDFs, describe_fn (a vision model) also turns
+        up to MAX_FIGURES_PER_PDF figures into searchable chunks. Returns (text_chunks, figures)."""
+        from images import add_pdf_images, delete_pdf_images
+
+        self.check_limits(name, len(data))
+        name = safe_name(name)
+        path = self.folder / name
+        if path.exists() and path.read_bytes() != data:              # new version of an existing file
+            old_id = file_id(path)
+            self.collection.delete(where={"doc_id": old_id})
+            delete_pdf_images(self.files, old_id)
+            self._changed()
+        self.files.upload(name, data)
+        path.write_bytes(data)
+        chunks = self._index_text(path)
+        figures = 0
+        if chunks and describe_fn and path.suffix.lower() == ".pdf":
+            figures = add_pdf_images(self.files, self.collection, path, file_id(path), name, describe_fn,
+                                     progress, on_error, max_images=MAX_FIGURES_PER_PDF)
+            self._changed()
+        return chunks, figures
+
+    def delete(self, name: str) -> None:
+        """Remove a document everywhere: storage, its figures, and all its chunks."""
+        from images import delete_pdf_images
+
+        metas = self.collection.get(where={"source": name}, include=["metadatas"])["metadatas"]
+        doc_ids = {m["doc_id"] for m in metas}
+        self.files.delete(name)
+        path = self.folder / name
+        if path.exists():
+            doc_ids.add(file_id(path))
+            path.unlink()
+        for doc_id in doc_ids:
+            delete_pdf_images(self.files, doc_id)
+            self.collection.delete(where={"doc_id": doc_id})
+        self.collection.delete(where={"source": name})
+        self._changed()
+
+    # ------------------------------------------------------------------ restore after restart
+    def sync(self, force: bool = False) -> dict | None:
+        """Make this user's index match their stored files — once per server start
+        (or when they press Reload). Figures come back without new vision calls."""
+        from images import restore_image_chunks
+
+        with _lock:
+            if self.key in _synced and not force:
+                return None
+            report = {"downloaded": 0, "indexed": 0, "removed": 0}
+            wanted = set(self.files.names())
+            present = set()
+            for name in sorted(wanted):
+                path = self.folder / name
+                if not path.exists():
+                    path.write_bytes(self.files.download(name))
+                    report["downloaded"] += 1
+                doc_id = file_id(path)
+                present.add(doc_id)
+                if self._index_text(path):
+                    report["indexed"] += 1
+                    if path.suffix.lower() == ".pdf":
+                        restore_image_chunks(self.files, self.collection, doc_id, name)
+            for d in self.documents():
+                if d["doc_id"] not in present:
+                    self.collection.delete(where={"doc_id": d["doc_id"]})
+                    report["removed"] += 1
+            for p in self.folder.iterdir():
+                if p.is_file() and p.suffix.lower() in SUPPORTED and p.name not in wanted:
+                    p.unlink()
+            self._changed()
+            _synced.add(self.key)
+            return report
+
+    # ------------------------------------------------------------------ settings (per user)
+    def settings(self) -> dict:
+        with _lock:
+            if self.key not in _settings_cache:
+                try:
+                    saved = json.loads(self.files.download(SETTINGS_FILE))
+                except Exception:
+                    saved = {}
+                _settings_cache[self.key] = {**DEFAULT_SETTINGS,
+                                             **{k: v for k, v in saved.items() if k in DEFAULT_SETTINGS}}
+            return dict(_settings_cache[self.key])
+
+    def save_setting(self, key: str, value) -> None:
+        current = self.settings()
+        current[key] = value
+        self.files.upload(SETTINGS_FILE, json.dumps(current, indent=2).encode())
+        with _lock:
+            _settings_cache[self.key] = current
+
+    # ------------------------------------------------------------------ search
+    def _keyword_index(self) -> dict:
+        with _lock:
+            version = (_kw_version.get(self.key, 0), self.collection.count())
+            cached = _kw_cache.get(self.key)
+            if not cached or cached["version"] != version:
+                got = self.collection.get(include=["documents", "metadatas"])
+                cached = {"version": version, "ids": got["ids"], "docs": got["documents"], "metas": got["metadatas"],
+                          "bm25": BM25([tokenize(d) for d in got["documents"]]),
+                          "pos": {cid: i for i, cid in enumerate(got["ids"])}}
+                _kw_cache[self.key] = cached
+            return cached
+
+    def _hybrid_rank(self, queries: list[str]) -> list[tuple[str, float]]:
+        n = self.collection.count()
+        if not n:
+            return []
+        kw = self._keyword_index()
+        fused: dict[str, float] = {}
+
+        def add(ranked_ids):
+            for rank, cid in enumerate(ranked_ids, start=1):
+                fused[cid] = fused.get(cid, 0.0) + 1.0 / (RRF_K + rank)
+
+        for q in queries:
+            add(self.collection.query(query_embeddings=[embed_query(q)], n_results=min(POOL, n))["ids"][0])
+            s = kw["bm25"].scores(tokenize(q))
+            add([kw["ids"][i] for i in sorted((i for i in range(len(s)) if s[i] > 0), key=lambda i: -s[i])[:POOL]])
+        return sorted(fused.items(), key=lambda kv: -kv[1])
+
+    def _named_figures(self, texts: list[str]) -> list[dict]:
+        refs = {(("table" if kind.lower().startswith("tab") else "figure"), num)
+                for t in texts for kind, nums in _FIGURE_REF.findall(t or "") for num in re.findall(r"\d+", nums)}
+        if not refs:
+            return []
+        got = self.collection.get(where={"kind": "image"}, include=["documents", "metadatas"])
+        out = []
+        for text, m in zip(got["documents"], got["metadatas"]):
+            cap = (m.get("caption") or "").strip()
+            hit = re.match(r"(fig(?:ure)?\.?|table)\s*(\d+)", cap, re.IGNORECASE)
+            if hit and (("table" if hit.group(1).lower().startswith("tab") else "figure"), hit.group(2)) in refs:
+                out.append(_hit(text, m, 1.0))
+        return out
+
+    def _best_figure(self, queries: list[str], ranked) -> list[dict]:
+        kw = self._keyword_index()
+        for cid, score in ranked:
+            i = kw["pos"].get(cid)
+            if i is not None and kw["metas"][i].get("kind") == "image":
+                return [_hit(kw["docs"][i], kw["metas"][i], score)]
+        try:
+            r = self.collection.query(query_embeddings=[embed_query(queries[0])], n_results=1, where={"kind": "image"})
+            return [_hit(r["documents"][0][0], r["metadatas"][0][0], 0.0)] if r["ids"][0] else []
+        except Exception:
+            return []
+
+    def search(self, question: str, attachments: list[dict] | None = None, k: int = 4,
+               queries: list[str] | None = None) -> list[dict]:
+        """The passages to answer from — ONLY from this user's library (+ their chat attachments)."""
+        attachments = attachments or []
+        all_queries = list(dict.fromkeys([question] + [q for q in (queries or []) if q and q.strip()]))[:4]
+
+        figures = self._named_figures(all_queries)
+        ranked = self._hybrid_rank(all_queries)
+        if not figures and _WANTS_PICTURE.search(question or "") and ranked:
+            figures = self._best_figure(all_queries, ranked)
+        taken = {f["image"] for f in figures}
+
+        lib = []
+        if ranked:
+            kw = self._keyword_index()
+            for cid, score in ranked:
+                i = kw["pos"].get(cid)
+                if i is not None and kw["metas"][i].get("image") not in taken:
+                    lib.append(_hit(kw["docs"][i], kw["metas"][i], score))
+
+        if not attachments:
+            return (figures + lib)[:max(k, len(figures))]
+
+        qvecs = np.array([embed_query(q) for q in all_queries], dtype=np.float32)
+        scores = (np.stack([a["vector"] for a in attachments]) @ qvecs.T).max(axis=1)
+        chosen = range(len(attachments)) if len(attachments) <= ATTACH_WHOLE_LIMIT \
+            else sorted(np.argsort(-scores)[:ATTACH_TOP])
+        att = [{"text": attachments[i]["text"], "source": attachments[i]["source"], "page": attachments[i]["page"],
+                "score": float(scores[i]), "attached": True} for i in chosen]
+        best_att = float(scores.max())
+        extra = []
+        if self.collection.count():
+            r = self.collection.query(query_embeddings=[qvecs[0].tolist()],
+                                      n_results=min(LIB_WITH_ATTACH, self.collection.count()))
+            extra = [_hit(t, m, 1 - d) for t, m, d in zip(r["documents"][0], r["metadatas"][0], r["distances"][0])
+                     if 1 - d > best_att and m.get("image") not in taken]
+        return att + figures + extra
 
 
-def named_figures(collection, texts: list[str]) -> list[dict]:
-    """Figures/tables named by number ("Figure 3", "figs 1 and 2", "Table 1"), matched on captions."""
-    refs = {(("table" if kind.lower().startswith("tab") else "figure"), num)
-            for t in texts for kind, nums in _FIGURE_REF.findall(t or "") for num in re.findall(r"\d+", nums)}
-    if not refs:
-        return []
-    got = collection.get(where={"kind": "image"}, include=["documents", "metadatas"])
-    out = []
-    for text, m in zip(got["documents"], got["metadatas"]):
-        cap = (m.get("caption") or "").strip()
-        hit = re.match(r"(fig(?:ure)?\.?|table)\s*(\d+)", cap, re.IGNORECASE)
-        if hit and (("table" if hit.group(1).lower().startswith("tab") else "figure"), hit.group(2)) in refs:
-            out.append(_hit(text, m, 1.0))
-    return out
-
-
-def best_figure(collection, queries: list[str], ranked: list[tuple[str, float]]) -> list[dict]:
-    """The best-matching figure: the highest-ranked figure in the fused results,
-    or, if none made it there, the closest figure by meaning."""
-    kw = _keyword_index(collection)
-    for cid, score in ranked:
-        i = kw["pos"].get(cid)
-        if i is not None and kw["metas"][i].get("kind") == "image":
-            return [_hit(kw["docs"][i], kw["metas"][i], score)]
-    try:
-        r = collection.query(query_embeddings=[embed_query(queries[0])], n_results=1, where={"kind": "image"})
-        return [_hit(r["documents"][0][0], r["metadatas"][0][0], 0.0)] if r["ids"][0] else []
-    except Exception:
-        return []
-
-
-def search(collection, attachments: list[dict], question: str, k: int = 4,
-           queries: list[str] | None = None) -> list[dict]:
-    """Find the passages to answer from.
-
-    queries: extra search phrases from query rewriting (router.py). The original
-    question is always searched too, so a poor rewrite can't make things worse.
-
-    No attachments -> the k best knowledge-base chunks (hybrid, multi-query).
-    Attachments    -> the user's own files come FIRST, like in ChatGPT: a small
-                      attachment is included in full, a large one contributes its
-                      best-matching chunks, and at most KB_WITH_ATTACH knowledge-
-                      base chunks are added, only if they match better.
-    """
-    all_queries = list(dict.fromkeys([question] + [q for q in (queries or []) if q and q.strip()]))[:4]
-
-    # figures: by number ("Figure 3"), or "show me the … figure/chart/diagram"
-    figures = named_figures(collection, all_queries)
-    ranked = hybrid_rank(collection, all_queries) if collection.count() else []
-    if not figures and _WANTS_PICTURE.search(question or "") and ranked:
-        figures = best_figure(collection, all_queries, ranked)
-    taken = {f["image"] for f in figures}
-
-    kw = _keyword_index(collection) if ranked else None
-    kb = []
-    for cid, score in ranked:
-        i = kw["pos"].get(cid)
-        if i is None or kw["metas"][i].get("image") in taken:
-            continue
-        kb.append(_hit(kw["docs"][i], kw["metas"][i], score))
-
-    if not attachments:
-        return (figures + kb)[:max(k, len(figures))]
-
-    qvecs = np.array([embed_query(q) for q in all_queries], dtype=np.float32)
-    scores = (np.stack([a["vector"] for a in attachments]) @ qvecs.T).max(axis=1)   # best match over all queries
-    if len(attachments) <= ATTACH_WHOLE_LIMIT:
-        chosen = range(len(attachments))                                # whole file(s), in reading order
-    else:
-        chosen = sorted(np.argsort(-scores)[:ATTACH_TOP])               # best chunks, kept in reading order
-    att = [{"text": attachments[i]["text"], "source": attachments[i]["source"], "page": attachments[i]["page"],
-            "score": float(scores[i]), "attached": True} for i in chosen]
-
-    # knowledge-base extras only when they match the question better than the attachment does
-    best_att = float(scores.max())
-    extra = []
-    if collection.count():
-        r = collection.query(query_embeddings=[qvecs[0].tolist()], n_results=min(KB_WITH_ATTACH, collection.count()))
-        extra = [_hit(t, m, 1 - d) for t, m, d in zip(r["documents"][0], r["metadatas"][0], r["distances"][0])
-                 if 1 - d > best_att and m.get("image") not in taken]
-    return att + figures + extra
+# =========================================================================== temporary attachments
+def read_attachment(name: str, data: bytes) -> list[dict]:
+    """Parse + chunk + embed one attached file entirely in memory/temp. Not saved anywhere."""
+    name = safe_name(name)
+    if Path(name).suffix.lower() not in SUPPORTED:
+        raise ValueError(f"{name}: only PDF, Markdown and text files are supported")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / name
+        path.write_bytes(data)
+        chunks = chunk_pages(extract_file(path))
+    if not chunks:
+        raise ValueError(f"{name}: no readable text (scanned PDF?)")
+    vectors = np.array(embed_passages([c["text"] for c in chunks]), dtype=np.float32)
+    return [{"text": c["text"], "source": name, "page": c["page"], "attached": True, "vector": v}
+            for c, v in zip(chunks, vectors)]

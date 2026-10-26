@@ -1,18 +1,18 @@
 """
-RAG chat app — admin-managed knowledge base, chat for everyone.
+RAG chat app — every user has their own private document library.
 
 RUN
     streamlit run chatapp.py
 
 WHO SEES WHAT
     Not logged in   -> login / sign-up page only.
-    Normal user     -> chat only (no sidebar). Answers come from the shared
-                       knowledge base. They can attach files in the chat box
-                       for extra context; those files are used for THIS chat
-                       only and are never saved.
-    Admin           -> the same chat + a sidebar to upload / delete / reload
-                       the shared knowledge base. Admin emails: ADMIN_EMAILS
-                       secret, default in auth.py.
+    Logged in       -> chat + a "My documents" sidebar. Each user uploads,
+                       deletes and searches ONLY their own documents; nobody
+                       else can see or search them (separate storage folder,
+                       separate search index — see knowledge_base.Library).
+                       Limits per user: knowledge_base.MAX_DOCUMENTS etc.
+                       Files attached in the chat box (📎) are used for THIS
+                       chat only and are never saved.
 
 LLM
     GROQ_API_KEY set  -> Groq (open-source gpt-oss)
@@ -29,22 +29,21 @@ import requests
 import streamlit as st
 
 from answer import LLM_MODEL, OLLAMA_URL, SYSTEM_PROMPT, find_citations
-from auth import (current_user, display_name, is_admin, log_out, login_page, supabase_client,
-                  supabase_enabled, update_name)
+from auth import (current_user, display_name, log_out, login_page, supabase_client, supabase_enabled,
+                  update_name)
 from privacy import PROMPT_NOTE as PRIVACY_NOTE
 from privacy import Masker
 from router import CHAT, chat_system_prompt, plan
 from images import load_image
-from knowledge_base import (SHARED_FOLDER, LocalFiles, SupabaseFiles, add_document, delete_document,
-                            ensure_synced, get_settings, list_documents, read_attachment, save_setting, search,
-                            shared_collection)
+from knowledge_base import (MAX_DOCUMENTS, MAX_FIGURES_PER_PDF, LimitError, Library, read_attachment)
+from knowledge_base import MAX_FILE_MB as MAX_LIBRARY_FILE_MB
 
 APP_NAME = "Personal Assistant"    # title on the login page, chat page and browser tab
-TAGLINE = "Ask questions across the knowledge base and get answers grounded in sources."
+TAGLINE = "Upload your own documents and get answers grounded in sources. Private to you."
 GROQ_MODEL = "openai/gpt-oss-20b"
-GROQ_VISION_MODEL = "qwen/qwen3.8-27b"   # reads images (admin uploads only)
+GROQ_VISION_MODEL = "qwen/qwen3.8-27b"   # describes figures in uploaded PDFs
 LOCAL_VISION_MODEL = "qwen2.5vl:3b"      # Ollama vision model for local mode: ollama pull qwen2.5vl:3b
-TOP_K = 4                        # default sources per answer; the admin can change it in the sidebar
+TOP_K = 4                        # default Top K; each user can change theirs in the sidebar
 ATTACH_MODE = "multiple"         # "multiple" = pick files, "directory" = pick a whole folder
 MAX_ATTACHED_FILES = 10          # per chat, to keep memory use small
 MAX_FILE_MB = 20
@@ -58,16 +57,16 @@ if not user:
     login_page(APP_NAME, TAGLINE)
     st.stop()
 
-admin = is_admin(user)
-files = SupabaseFiles(supabase_client()) if supabase_enabled() else LocalFiles()
-collection = shared_collection()
-settings = get_settings(files)          # admin-chosen, app-wide (e.g. sources per answer)
+# This user's private library: their own storage folder + their own search index.
+library = Library(user, supabase_client() if supabase_enabled() else None)
+files = library.files
+settings = library.settings()            # this user's own choices (Top K)
 
 try:
-    with st.spinner("Preparing the knowledge base…"):
-        ensure_synced(files, collection)        # no-op unless the server just restarted
+    with st.spinner("Preparing your documents…"):
+        library.sync()                   # no-op unless the server just restarted
 except Exception as e:
-    st.error(f"Couldn't load the knowledge base: {e}")
+    st.error(f"Couldn't load your documents: {e}")
 
 st.session_state.setdefault("messages", [])
 st.session_state.setdefault("attachments", [])     # chunks of files attached in this chat
@@ -94,7 +93,7 @@ def sources_for_llm(chunks: list[dict]) -> str:
     blocks = []
     for n, c in enumerate(chunks, start=1):
         page = f", page {c['page']}" if c.get("page") else ""
-        label = " (file attached by the user)" if c.get("attached") else " (knowledge base)"
+        label = " (file attached by the user)" if c.get("attached") else " (their library)"
         blocks.append(f"[{n}] {c['source']}{page}{label}\n{c['text']}")
     return "\n\n".join(blocks)
 
@@ -229,7 +228,7 @@ def _retry_after_seconds(error) -> float:
 
 
 def describe_image(png: bytes, prompt: str, on_wait=None) -> str:
-    """Ask a vision model to describe one image (used when the admin uploads a PDF).
+    """Ask a vision model to describe one image (used when a user uploads a PDF).
     The prompt includes text from the PDF page, so it is privacy-masked like everything else."""
     import base64
     import re as _re
@@ -299,7 +298,7 @@ def figures_to_show(question: str, sources: list[dict], cited: list[int]) -> lis
 def show_figures(figures: list[dict]) -> None:
     """Draw figures directly under the answer (not hidden in the Sources box)."""
     for f in figures:
-        picture = load_image(files, f["image"], SHARED_FOLDER)
+        picture = load_image(files, f["image"], library.folder)
         if picture:
             page = f", page {f['page']}" if f.get("page") else ""
             label = f"{f['caption']} — " if f.get("caption") else "🖼️ Figure from "
@@ -317,7 +316,7 @@ def show_sources(sources: list[dict], cited: list[int], queries: list[str] | Non
             where = " · 📎 your attachment" if c.get("attached") else (" · 🖼️ figure" if c.get("image") else "")
             st.markdown(f"**[{n}] {c['source']}{page}**{where} — {'✅ cited' if n in cited else 'not cited'}")
             if c.get("image"):                                     # show the picture itself
-                picture = load_image(files, c["image"], SHARED_FOLDER)
+                picture = load_image(files, c["image"], library.folder)
                 if picture:
                     st.image(picture, width=420)
             st.caption(c["text"][:600] + ("…" if len(c["text"]) > 600 else ""))
@@ -326,110 +325,114 @@ def show_sources(sources: list[dict], cited: list[int], queries: list[str] | Non
 # =========================================================================== delete confirmation
 @st.dialog("Delete document?", icon="⚠️")
 def confirm_delete(name: str, n_chunks: int) -> None:
-    """Pop-up shown before the admin deletes a knowledge-base document."""
+    """Pop-up shown before a user deletes one of their documents."""
     st.markdown(f"**{name}** ({n_chunks} chunks)")
-    st.warning("This permanently removes the file from storage and from the knowledge base. "
-               "Nobody will get answers from it any more, and this can't be undone.")
+    st.warning("This permanently removes the file and its figures from your library. "
+               "You won't get answers from it any more, and this can't be undone.")
     cancel_col, delete_col = st.columns(2)
     if cancel_col.button("Cancel", use_container_width=True):
         st.rerun()
     if delete_col.button("Delete", type="primary", use_container_width=True):
         with st.spinner("Deleting…"):
-            delete_document(files, collection, name)
+            library.delete(name)
         st.session_state["_deleted_note"] = name
         st.rerun()
 
 
-# =========================================================================== 2. admin sidebar
-docs = list_documents(collection)
+# =========================================================================== 2. "My documents" sidebar
+docs = library.documents()
 
-if admin:                         # normal users never call st.sidebar, so they don't get one
-    with st.sidebar:
-        st.header("🛠️ Knowledge base")
-        st.caption("Admin only. Files added here are saved permanently and used for everyone's answers.")
+with st.sidebar:
+    st.header("📁 My documents")
+    st.caption("Private to you: other users can't see or search these files.")
+    st.caption(f"Limits: {MAX_DOCUMENTS} documents · {MAX_LIBRARY_FILE_MB} MB per file · "
+               f"{MAX_FIGURES_PER_PDF} figures read per PDF")
 
-        with st.form("upload", clear_on_submit=True):
-            uploads = st.file_uploader("Add PDF, Markdown or text files", type=["pdf", "md", "txt"],
-                                       accept_multiple_files=True)
-            read_images = st.checkbox("Also read images inside PDFs", value=True,
-                                      help="Charts, diagrams and photos are described by a vision AI "
-                                           f"({vision_label()}) so they can be searched. Slower uploads.")
-            if st.form_submit_button("Add to knowledge base", type="primary", use_container_width=True) and uploads:
-                for f in uploads:
-                    bar = st.progress(0.0, text=f"Reading {f.name}…")
+    with st.form("upload", clear_on_submit=True):
+        uploads = st.file_uploader("Add PDF, Markdown or text files", type=["pdf", "md", "txt"],
+                                   accept_multiple_files=True)
+        read_images = st.checkbox("Also read images inside PDFs", value=True,
+                                  help="Charts, diagrams and photos are described by a vision AI "
+                                       f"({vision_label()}) so they can be searched. Slower uploads.")
+        if st.form_submit_button("Add to my documents", type="primary", use_container_width=True) and uploads:
+            for f in uploads:
+                bar = st.progress(0.0, text=f"Reading {f.name}…")
 
-                    state = {"done": 0, "total": 1}
+                state = {"done": 0, "total": 1}
 
-                    def progress(done, total, name=f.name, bar=bar, state=state):
-                        state.update(done=done, total=total)
-                        bar.progress(done / total, text=f"{name}: describing image {done} of {total}…")
+                def progress(done, total, name=f.name, bar=bar, state=state):
+                    state.update(done=done, total=total)
+                    bar.progress(done / total, text=f"{name}: describing image {done} of {total}…")
 
-                    def waiting(seconds, name=f.name, bar=bar, state=state):
-                        bar.progress(state["done"] / state["total"],
-                                     text=f"{name}: Groq free-tier limit reached, waiting {seconds:.0f} s before "
-                                          f"image {state['done']} of {state['total']}…")
+                def waiting(seconds, name=f.name, bar=bar, state=state):
+                    bar.progress(state["done"] / state["total"],
+                                 text=f"{name}: Groq free-tier limit reached, waiting {seconds:.0f} s before "
+                                      f"image {state['done']} of {state['total']}…")
 
-                    image_errors = []
-                    try:
-                        added, figures = add_document(files, collection, f.name, f.getvalue(),
-                                                      describe_fn=(lambda png, prompt, w=waiting: describe_image(png, prompt, on_wait=w))
-                                                      if read_images else None,
-                                                      progress=progress, on_error=image_errors.append)
-                        bar.empty()
-                        if added:
-                            st.success(f"{f.name}: {added} chunks" + (f" + {figures} figures" if figures else ""))
-                            if image_errors:          # tell the admin instead of silently skipping
-                                st.warning(f"{len(image_errors)} image(s) couldn't be read by the vision model "
-                                           f"({vision_label()}). First error — {image_errors[0][:300]}")
-                        else:
-                            st.info(f"{f.name}: already in the knowledge base. To re-read its figures, "
-                                    "delete it with 🗑️ and upload it again.")
-                    except Exception as e:
-                        bar.empty()
-                        st.error(f"{f.name}: {e}")
-                docs = list_documents(collection)
+                image_errors = []
+                try:
+                    added, figures = library.add(f.name, f.getvalue(),
+                                                 describe_fn=(lambda png, prompt, w=waiting: describe_image(png, prompt, on_wait=w))
+                                                 if read_images else None,
+                                                 progress=progress, on_error=image_errors.append)
+                    bar.empty()
+                    if added:
+                        st.success(f"{f.name}: {added} chunks" + (f" + {figures} figures" if figures else ""))
+                        if image_errors:          # say so instead of silently skipping
+                            st.warning(f"{len(image_errors)} image(s) couldn't be read by the vision model "
+                                       f"({vision_label()}). First error — {image_errors[0][:300]}")
+                    else:
+                        st.info(f"{f.name}: already in your documents. To re-read its figures, "
+                                "delete it with 🗑️ and upload it again.")
+                except LimitError as e:
+                    bar.empty()
+                    st.warning(str(e))
+                except Exception as e:
+                    bar.empty()
+                    st.error(f"{f.name}: {e}")
+            docs = library.documents()
 
-        deleted = st.session_state.pop("_deleted_note", None)
-        if deleted:
-            st.toast(f"Deleted {deleted}", icon="🗑️")      # small pop-up that disappears by itself
-        st.caption(f"{len(docs)} document(s) · {collection.count()} chunks")
-        for d in docs:
-            left, right = st.columns([5, 1])
-            figs = f" · {d['figures']} figures" if d.get("figures") else ""
-            left.markdown(f"**{d['source']}**  \n{d['chunks'] - d.get('figures', 0)} chunks{figs}")
-            if right.button("🗑️", key=f"del-{d['doc_id']}", help=f"Delete {d['source']}"):
-                confirm_delete(d["source"], d["chunks"])        # opens a "are you sure?" window
+    deleted = st.session_state.pop("_deleted_note", None)
+    if deleted:
+        st.toast(f"Deleted {deleted}", icon="🗑️")      # small pop-up that disappears by itself
+    st.caption(f"{len(docs)} of {MAX_DOCUMENTS} documents")
+    for d in docs:
+        left, right = st.columns([5, 1])
+        figs = f" · {d['figures']} figures" if d.get("figures") else ""
+        left.markdown(f"**{d['source']}**  \n{d['chunks'] - d.get('figures', 0)} chunks{figs}")
+        if right.button("🗑️", key=f"del-{d['doc_id']}", help=f"Delete {d['source']}"):
+            confirm_delete(d["source"], d["chunks"])        # opens a "are you sure?" window
 
-        st.divider()
-        st.subheader("⚙️ Answer settings")
-        current_k = settings["sources_per_answer"]
-        new_k = st.slider("Top K (passages retrieved per answer)", min_value=2, max_value=10, value=current_k,
-                          help="Top K = how many of the best-matching passages are retrieved and given to the AI "
-                               "for each answer. The AI then cites only the ones it actually uses. Higher K gives "
-                               "fuller answers but uses more of the AI's free quota. Applies to everyone.")
-        st.caption(f"Currently retrieving the top **{current_k}** passages per question.")
-        if new_k != current_k:
-            try:
-                save_setting(files, "sources_per_answer", new_k)
-                settings["sources_per_answer"] = new_k
-                st.toast(f"Top K set to {new_k}", icon="⚙️")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Couldn't save the setting: {e}")
-
-        if st.button("🔄 Reload from storage", use_container_width=True):
-            ensure_synced(files, collection, force=True)
+    st.divider()
+    st.subheader("⚙️ Answer settings")
+    current_k = settings["top_k"]
+    new_k = st.slider("Top K (passages retrieved per answer)", min_value=2, max_value=10, value=current_k,
+                      help="Top K = how many of the best-matching passages are retrieved and given to the AI "
+                           "for each answer. The AI then cites only the ones it actually uses. Higher K gives "
+                           "fuller answers but uses more of the AI's free quota. Only affects your answers.")
+    st.caption(f"Currently retrieving the top **{current_k}** passages per question.")
+    if new_k != current_k:
+        try:
+            library.save_setting("top_k", new_k)
+            settings["top_k"] = new_k
+            st.toast(f"Top K set to {new_k}", icon="⚙️")
             st.rerun()
+        except Exception as e:
+            st.error(f"Couldn't save the setting: {e}")
 
-        st.divider()
-        llm = f"`{GROQ_MODEL}` (Groq)" if _secret("GROQ_API_KEY") else f"`{LLM_MODEL}` (Ollama)"
-        st.caption(f"LLM: {llm}")
+    if st.button("🔄 Reload from storage", use_container_width=True):
+        library.sync(force=True)
+        st.rerun()
+
+    st.divider()
+    llm = f"`{GROQ_MODEL}` (Groq)" if _secret("GROQ_API_KEY") else f"`{LLM_MODEL}` (Ollama)"
+    st.caption(f"LLM: {llm}")
 
 
 # =========================================================================== 3. header
 st.title(f"🔎 {APP_NAME}")
 who_col, b1, b2 = st.columns([4, 1, 1], vertical_alignment="center")
-with who_col.popover(f"👤 {display_name(user)}" + (" · admin" if admin else "")):
+with who_col.popover(f"👤 {display_name(user)}"):
     st.caption(f"Signed in as {user['email']}")
     with st.form("rename", clear_on_submit=True, border=False):
         new_name = st.text_input("Your name", placeholder=display_name(user), max_chars=60)
@@ -460,8 +463,9 @@ first_name = display_name(user).split()[0]
 if not messages:
     with st.chat_message("assistant"):
         st.markdown(f"Hi {first_name}! How can I help you today?")
-        if admin and not docs:                 # only the admin is told the knowledge base is empty
-            st.caption("The knowledge base is empty. Add documents in the sidebar.")
+        if not docs:
+            st.caption("Your library is empty. Add documents in the sidebar (they stay private to you), "
+                       "or attach a file here with 📎 for this chat only.")
 
 for msg in messages:
     with st.chat_message(msg["role"]):
@@ -524,11 +528,10 @@ if submission:
                     show_privacy_note(hidden)
                 else:                                      # ---- 4c. search + cited answer
                     with st.spinner("Searching…"):
-                        chunks = search(collection, st.session_state["attachments"], question,
-                                        settings["sources_per_answer"],
-                                        queries=search_queries)
+                        chunks = library.search(question, st.session_state["attachments"],
+                                                settings["top_k"], queries=search_queries)
                     if not chunks:
-                        text = "There's nothing to search yet: the knowledge base is empty and no files are attached."
+                        text = "There's nothing to search yet: your library is empty and no files are attached."
                         st.markdown(text)
                     else:
                         text = show_stream(stream_answer(question, chunks))
