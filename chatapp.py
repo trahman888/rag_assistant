@@ -41,13 +41,14 @@ from images import load_image
 from knowledge_base import (MAX_DOCUMENTS, MAX_FIGURES_PER_PDF, LimitError, Library, read_attachment)
 from knowledge_base import MAX_FILE_MB as MAX_LIBRARY_FILE_MB
 
-APP_NAME = "My Document Assistant"    # title on the login page, chat page and browser tab
+APP_NAME = "Personal Assistant"    # title on the login page, chat page and browser tab
 TAGLINE = "Upload your own documents and get answers grounded in sources. Private to you."
 GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_VISION_MODEL = "qwen/qwen3.8-27b"   # describes figures in uploaded PDFs
 LOCAL_VISION_MODEL = "qwen2.5vl:3b"      # Ollama vision model for local mode: ollama pull qwen2.5vl:3b
 TOP_K = 4                        # default Top K; each user can change theirs in the sidebar
 ATTACH_MODE = "multiple"         # "multiple" = pick files, "directory" = pick a whole folder
+EVAL_EMAILS = "tanzila.himu@gmail.com"   # who sees the 📊 Evaluation page (comma-separated; or an EVAL_EMAILS secret)
 MAX_ATTACHED_FILES = 10          # per chat, to keep memory use small
 MAX_FILE_MB = 20
 
@@ -425,10 +426,13 @@ with st.sidebar:
                 st.rerun()
         st.divider()
 
-    view = st.segmented_control("View", ["💬 Chat", "📊 Evaluation"], default="💬 Chat", key="view",
-                                label_visibility="collapsed") or "💬 Chat"
+    can_evaluate = user["email"].lower() in {e.strip().lower() for e in (_secret("EVAL_EMAILS") or EVAL_EMAILS).split(",")}
+    view = "💬 Chat"
+    if can_evaluate:                                         # everyone else just has the chat
+        view = st.segmented_control("View", ["💬 Chat", "📊 Evaluation"], default="💬 Chat", key="view",
+                                    label_visibility="collapsed") or "💬 Chat"
     st.header("📁 My documents")
-    #st.caption("Private to you: other users can't see or search these files.")
+    st.caption("Private to you: other users can't see or search these files.")
     st.caption(f"Limits: {MAX_DOCUMENTS} documents · {MAX_LIBRARY_FILE_MB} MB per file · "
                f"{MAX_FIGURES_PER_PDF} figures read per PDF")
 
