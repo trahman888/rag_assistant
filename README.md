@@ -1,6 +1,6 @@
 # 🔎 Personal Assistant: chat with your own documents
 
-A retrieval-augmented generation (RAG) assistant. Each user uploads their own PDFs, notes and text files, then asks questions in a chat. Answers come **only from their documents**, with numbered citations to the exact file and page. It also finds and shows **figures and charts** from inside PDFs.
+A retrieval-augmented generation (RAG) assistant. Each user uploads their own PDFs, Word and PowerPoint files, notes and text files, then asks questions in a chat. Answers come **only from their documents**, with numbered citations to the exact file and page. It also finds and shows **figures and charts** from inside PDFs.
 
 Everything runs on free, open-source models and free hosting tiers.
 
@@ -13,8 +13,8 @@ Everything runs on free, open-source models and free hosting tiers.
 ## Features
 
 **Documents**
-- Upload PDF, Markdown and text files to a **private library**: other users can't see or search them.
-- Figures inside PDFs (charts, diagrams, photos) are detected, cropped, described by a vision model and made searchable. Ask "show me Figure 3" or "show me the chart about costs" and the figure appears under the answer.
+- Upload PDF, Word (.docx), PowerPoint (.pptx), Markdown and text files to a **private library**: other users can't see or search them.
+- Figures inside PDFs, Word and PowerPoint files (charts, diagrams, photos) are detected, cropped, described by a vision model and made searchable. Ask "show me Figure 3" or "show me the chart about costs" and the figure appears under the answer.
 - Attach files in the chat (📎) for one conversation only, without saving them.
 - Per-user limits: 20 documents, 20 MB per file, 10 figures read per PDF.
 
@@ -43,7 +43,7 @@ Everything runs on free, open-source models and free hosting tiers.
 ```mermaid
 flowchart LR
     subgraph Upload
-        A[PDF / MD / TXT] --> B[Extract text<br/>per page]
+        A[PDF / DOCX / PPTX<br/>MD / TXT] --> B[Extract text<br/>per page or slide]
         B --> C[Chunk<br/>800 chars, 150 overlap]
         C --> D[Embed<br/>bge-small-en-v1.5]
         A --> F[Detect figures<br/>PyMuPDF]
@@ -120,7 +120,7 @@ A vision model writes a searchable description of each figure. The descriptions 
 | Embeddings | `BAAI/bge-small-en-v1.5` (sentence-transformers) |
 | Vector database | ChromaDB |
 | Keyword search | BM25 (implemented in `knowledge_base.py`) |
-| PDF parsing | pypdf (text), PyMuPDF (figures) |
+| Document parsing | pypdf (PDF text), PyMuPDF (PDF figures), python-docx, python-pptx |
 | Auth and file storage | Supabase (free tier) |
 
 ---
@@ -134,6 +134,7 @@ A vision model writes a searchable description of each figure. The descriptions 
 | `evaluation.py` | Test cases, hit rate / MRR / citation checks, question generation |
 | `eval_page.py` | The 📊 Evaluation page |
 | `router.py` | Small-talk detection, LLM routing and query rewriting |
+| `extractors.py` | Word and PowerPoint: text, tables, speaker notes, page/slide numbers, embedded pictures |
 | `images.py` | Figure detection, cropping, captions, descriptions, restore |
 | `embedder.py` | Loads the BGE embedding model and embeds passages and queries |
 | `privacy.py` | Reversible PII masking (`Masker`) |
@@ -190,7 +191,6 @@ On a test set of 14 questions about a research paper, written in different words
 - The free Groq tier limits vision output per minute, so figure-heavy PDFs upload slowly. The app waits and retries automatically.
 - Planned:
   - multiple saved chats;
-  - .docx/.pptx support;
   - "ask only this document".
 
 ---

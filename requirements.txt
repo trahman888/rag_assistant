@@ -8,3 +8,5 @@ streamlit
 groq
 supabase
 pymupdf                # reads images inside PDFs (images.py)
+python-docx            # reads Word files (extractors.py)
+python-pptx            # reads PowerPoint files (extractors.py)

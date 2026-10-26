@@ -36,7 +36,7 @@ CHAT ATTACHMENTS (📎) — this chat only, never saved
     Read, chunked and embedded in memory; they come first in search results.
 
 USES FROM vector_store.py
-    DB_DIR, file_id, extract_file, chunk_pages
+    DB_DIR, file_id, chunk_pages   (+ extractors.extract_any for Word and PowerPoint)
 """
 import hashlib
 import json
@@ -51,10 +51,12 @@ import chromadb
 import numpy as np
 
 from embedder import collection_suffix, embed_passages, embed_query
-from vector_store import DB_DIR, chunk_pages, extract_file, file_id
+from extractors import extract_any
+from vector_store import DB_DIR, chunk_pages, file_id
 
 BUCKET = "documents"
-SUPPORTED = {".pdf", ".md", ".txt"}
+SUPPORTED = {".pdf", ".md", ".txt", ".docx", ".pptx"}
+WITH_FIGURES = {".pdf", ".docx", ".pptx"}     # file types whose pictures are described by the vision model
 DATA_ROOT = Path(__file__).parent / "user_data"
 
 # ---- limits per user --------------------------------------------------------
@@ -114,7 +116,9 @@ class SupabaseFiles:
 
     def upload(self, name: str, data: bytes) -> None:
         content_type = {"pdf": "application/pdf", "md": "text/markdown", "png": "image/png",
-                        "json": "application/json"}.get(name.rsplit(".", 1)[-1].lower(), "text/plain")
+                        "json": "application/json",
+                        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation"}.get(name.rsplit(".", 1)[-1].lower(), "text/plain")
         self.bucket.upload(f"{self.prefix}/{name}", data, {"content-type": content_type, "upsert": "true"})
 
     def download(self, name: str) -> bytes:
@@ -249,7 +253,7 @@ class Library:
         doc_id = file_id(path)
         if self.collection.get(where={"doc_id": doc_id}, limit=1)["ids"]:
             return 0
-        chunks = chunk_pages(extract_file(path))
+        chunks = chunk_pages(extract_any(path))
         if not chunks:
             return 0
         self.collection.add(
@@ -288,7 +292,7 @@ class Library:
         path.write_bytes(data)
         chunks = self._index_text(path)
         figures = 0
-        if chunks and describe_fn and path.suffix.lower() == ".pdf":
+        if chunks and describe_fn and path.suffix.lower() in WITH_FIGURES:
             figures = add_pdf_images(self.files, self.collection, path, file_id(path), name, describe_fn,
                                      progress, on_error, max_images=MAX_FIGURES_PER_PDF)
             self._changed()
@@ -332,7 +336,7 @@ class Library:
                 present.add(doc_id)
                 if self._index_text(path):
                     report["indexed"] += 1
-                    if path.suffix.lower() == ".pdf":
+                    if path.suffix.lower() in WITH_FIGURES:
                         restore_image_chunks(self.files, self.collection, doc_id, name)
             for d in self.documents():
                 if d["doc_id"] not in present:
@@ -524,13 +528,13 @@ def read_attachment(name: str, data: bytes) -> list[dict]:
     """Parse + chunk + embed one attached file entirely in memory/temp. Not saved anywhere."""
     name = safe_name(name)
     if Path(name).suffix.lower() not in SUPPORTED:
-        raise ValueError(f"{name}: only PDF, Markdown and text files are supported")
+        raise ValueError(f"{name}: only PDF, Word, PowerPoint, Markdown and text files are supported")
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / name
         path.write_bytes(data)
-        chunks = chunk_pages(extract_file(path))
+        chunks = chunk_pages(extract_any(path))
     if not chunks:
-        raise ValueError(f"{name}: no readable text (scanned PDF?)")
+        raise ValueError(f"{name}: no readable text (a scanned PDF, or slides with only pictures?)")
     vectors = np.array(embed_passages([c["text"] for c in chunks]), dtype=np.float32)
     return [{"text": c["text"], "source": name, "page": c["page"], "attached": True, "vector": v}
             for c, v in zip(chunks, vectors)]

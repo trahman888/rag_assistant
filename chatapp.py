@@ -36,6 +36,7 @@ from privacy import Masker
 from router import CHAT, chat_system_prompt, plan
 import time as _time
 import uuid
+from extractors import location
 from images import load_image
 from knowledge_base import (MAX_DOCUMENTS, MAX_FIGURES_PER_PDF, LimitError, Library, read_attachment)
 from knowledge_base import MAX_FILE_MB as MAX_LIBRARY_FILE_MB
@@ -107,7 +108,7 @@ def sources_for_llm(chunks: list[dict]) -> str:
     which document "my file" / "this PDF" refers to."""
     blocks = []
     for n, c in enumerate(chunks, start=1):
-        page = f", page {c['page']}" if c.get("page") else ""
+        page = location(c["source"], c.get("page"))
         label = " (file attached by the user)" if c.get("attached") else " (their library)"
         blocks.append(f"[{n}] {c['source']}{page}{label}\n{c['text']}")
     return "\n\n".join(blocks)
@@ -315,9 +316,9 @@ def show_figures(figures: list[dict]) -> None:
     for f in figures:
         picture = load_image(files, f["image"], library.folder)
         if picture:
-            page = f", page {f['page']}" if f.get("page") else ""
+            page = location(f["source"], f.get("page"))
             label = f"{f['caption']} — " if f.get("caption") else "🖼️ Figure from "
-            st.image(picture, caption=f"{label}{f['source']}{page}", width=520)
+            st.image(picture, caption=md_safe(f"{label}{f['source']}{page}"), width=520)
 
 
 def show_sources(sources: list[dict], cited: list[int], queries: list[str] | None = None) -> None:
@@ -327,14 +328,14 @@ def show_sources(sources: list[dict], cited: list[int], queries: list[str] | Non
         if queries:
             st.caption("🔎 Searched for: " + " · ".join(f"“{q}”" for q in queries))
         for n, c in enumerate(sources, start=1):
-            page = f", page {c['page']}" if c.get("page") else ""
+            page = location(c["source"], c.get("page"))
             where = " · 📎 your attachment" if c.get("attached") else (" · 🖼️ figure" if c.get("image") else "")
             st.markdown(f"**[{n}] {c['source']}{page}**{where} — {'✅ cited' if n in cited else 'not cited'}")
             if c.get("image"):                                     # show the picture itself
                 picture = load_image(files, c["image"], library.folder)
                 if picture:
                     st.image(picture, width=420)
-            st.caption(c["text"][:600] + ("…" if len(c["text"]) > 600 else ""))
+            st.caption(md_safe(c["text"][:600] + ("…" if len(c["text"]) > 600 else "")))
 
 
 # =========================================================================== 👍 / 👎 feedback
@@ -395,9 +396,10 @@ with st.sidebar:
                f"{MAX_FIGURES_PER_PDF} figures read per PDF")
 
     with st.form("upload", clear_on_submit=True):
-        uploads = st.file_uploader("Add PDF, Markdown or text files", type=["pdf", "md", "txt"],
+        uploads = st.file_uploader("Add PDF, Word, PowerPoint, Markdown or text files",
+                                   type=["pdf", "docx", "pptx", "md", "txt"],
                                    accept_multiple_files=True)
-        read_images = st.checkbox("Also read images inside PDFs", value=True,
+        read_images = st.checkbox("Also read images inside documents", value=True,
                                   help="Charts, diagrams and photos are described by a vision AI "
                                        f"({vision_label()}) so they can be searched. Slower uploads.")
         if st.form_submit_button("Add to my documents", type="primary", use_container_width=True) and uploads:
@@ -535,7 +537,7 @@ for i, msg in enumerate(messages):
             feedback_widget(i)
 
 submission = st.chat_input("Ask a question, or attach files with 📎…", accept_file=ATTACH_MODE,
-                           file_type=["pdf", "md", "txt"], max_upload_size=MAX_FILE_MB)
+                           file_type=["pdf", "docx", "pptx", "md", "txt"], max_upload_size=MAX_FILE_MB)
 
 if submission:
     question = (submission.text or "").strip()

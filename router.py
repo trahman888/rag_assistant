@@ -46,7 +46,7 @@ _SMALL_TALK = re.compile(r"""^(
     | what\s+can\s+you\s+do | how\s+can\s+you\s+help(\s+me)? | help
 )$""", re.IGNORECASE | re.VERBOSE)
 
-_ABOUT_ATTACHMENT = re.compile(r"\b(my|this|the|attached|uploaded)\s+(pdf|file|document|doc|notes?|paper|report)s?\b",
+_ABOUT_ATTACHMENT = re.compile(r"\b(my|this|the|attached|uploaded)\s+(pdf|file|document|doc|docx|notes?|paper|report|slides?|deck|presentation|pptx)s?\b",
                                re.IGNORECASE)
 
 def _clean(text: str) -> str:

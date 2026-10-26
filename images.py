@@ -85,6 +85,10 @@ def extract_images(pdf_path: Path, max_images: int = MAX_IMAGES) -> list[dict]:
     So instead we find WHERE figures are on each page (embedded pictures plus
     drawn graphics), merge pieces that touch into one figure, pull in their
     axis labels, skip whole-page captures, and render exactly that area."""
+    if Path(pdf_path).suffix.lower() in (".docx", ".pptx"):     # Word / PowerPoint: their embedded pictures
+        from extractors import office_images
+        return office_images(pdf_path, max_images)
+
     import pymupdf
 
     found, seen = [], set()
@@ -264,7 +268,8 @@ def add_pdf_images(files, collection, pdf_path: Path, doc_id: str, source: str,
 def _index(collection, doc_id: str, source: str, records: list[dict]) -> None:
     from embedder import embed_passages
 
-    texts = [f"[Figure on page {r['page']}]" + (f" {r['caption'].rstrip('. ')}." if r.get("caption") else "")
+    unit = "slide" if source.lower().endswith(".pptx") else "page"
+    texts = [f"[Figure on {unit} {r['page']}]" + (f" {r['caption'].rstrip('. ')}." if r.get("caption") else "")
              + f" {r['description']}" for r in records]
     collection.upsert(
         ids=[f"{doc_id}-img-{r['file']}" for r in records],
