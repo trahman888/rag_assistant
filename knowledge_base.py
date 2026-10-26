@@ -6,6 +6,7 @@ ONE LIBRARY PER USER (class Library)
                     <user_id>/report.pdf
                     <user_id>/_images/<doc_id>/p2_1.png   (figures + index.json)
                     <user_id>/_settings.json              (that user's Top K)
+                    <user_id>/_chat.json                  (their current conversation)
                 Supabase's security rules only let a logged-in user touch the
                 folder named after their own id (see SETUP_SUPABASE.md).
                 Local mode: user_data/<user>/docs/ on this computer.
@@ -61,6 +62,8 @@ MAX_FIGURES_PER_PDF = 10    # figures described per PDF (each one uses the visio
 
 DEFAULT_SETTINGS = {"top_k": 4}
 SETTINGS_FILE = "_settings.json"
+CHAT_FILE = "_chat.json"
+MAX_SAVED_MESSAGES = 60     # older messages of a very long chat are not kept
 
 
 class LimitError(ValueError):
@@ -356,6 +359,32 @@ class Library:
         self.files.upload(SETTINGS_FILE, json.dumps(current, indent=2).encode())
         with _lock:
             _settings_cache[self.key] = current
+
+    # ------------------------------------------------------------------ conversation (survives a page refresh)
+    def load_chat(self) -> list[dict]:
+        try:
+            messages = json.loads(self.files.download(CHAT_FILE))
+            return messages if isinstance(messages, list) else []
+        except Exception:
+            return []                                   # no saved chat yet
+
+    def save_chat(self, messages: list[dict]) -> None:
+        """Save the conversation in the user's private folder. Passages that came from
+        📎 attachments are saved WITHOUT their text, because attachments are never stored."""
+        keep = []
+        for m in messages[-MAX_SAVED_MESSAGES:]:
+            m = dict(m)
+            if m.get("sources"):
+                m["sources"] = [{k: v for k, v in c.items() if k != "vector"} | ({"text": "(attached file, not saved)"}
+                                if c.get("attached") else {}) for c in m["sources"]]
+            keep.append(m)
+        self.files.upload(CHAT_FILE, json.dumps(keep, default=float).encode())
+
+    def clear_chat(self) -> None:
+        try:
+            self.files.delete(CHAT_FILE)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ search
     def _keyword_index(self) -> dict:

@@ -68,12 +68,23 @@ try:
 except Exception as e:
     st.error(f"Couldn't load your documents: {e}")
 
-st.session_state.setdefault("messages", [])
+if st.session_state.get("_chat_owner") != user["id"]:      # new browser session (e.g. a refresh) or new user
+    st.session_state["messages"] = library.load_chat()       # bring back their last conversation
+    st.session_state["attachments"], st.session_state["attached_names"] = [], []
+    st.session_state["_chat_owner"] = user["id"]
 st.session_state.setdefault("attachments", [])     # chunks of files attached in this chat
 st.session_state.setdefault("attached_names", [])
 
 
+def save_chat():
+    try:
+        library.save_chat(st.session_state["messages"])
+    except Exception as e:
+        st.toast(f"Couldn't save this conversation: {e}", icon="⚠️")
+
+
 def new_chat():
+    library.clear_chat()
     st.session_state["messages"] = []
     st.session_state["attachments"] = []
     st.session_state["attached_names"] = []
@@ -552,5 +563,6 @@ if submission:
 
     messages.append({"role": "assistant", "content": text, "sources": chunks, "cited": cited, "hidden": hidden,
                      "figures": figures, "queries": search_queries})
+    save_chat()                   # so a page refresh brings the conversation back
     if read_ok:
         st.rerun()                # redraw so the "📎 In this chat only" banner appears right away
