@@ -140,6 +140,25 @@ class SupabaseFiles:
         items = self.bucket.list(f"{self.prefix}/{sub}", {"limit": 1000})
         return [i["name"] for i in items if i.get("name") and not i["name"].startswith(".")]
 
+    def wipe(self) -> int:
+        """Delete EVERYTHING in this user's folder (all sub-folders too). Returns files deleted."""
+        paths = []
+
+        def walk(folder):
+            for item in self.bucket.list(folder, {"limit": 1000}):
+                name = item.get("name")
+                if not name:
+                    continue
+                if item.get("id") is None:          # Supabase lists sub-folders without an id
+                    walk(f"{folder}/{name}")
+                else:
+                    paths.append(f"{folder}/{name}")
+
+        walk(self.prefix)
+        for i in range(0, len(paths), 100):
+            self.bucket.remove(paths[i:i + 100])
+        return len(paths)
+
 
 class LocalFiles:
     """Local mode: the user's folder on this computer is the permanent store."""
@@ -165,6 +184,12 @@ class LocalFiles:
     def list_folder(self, sub: str) -> list[str]:
         f = self.folder / sub
         return [p.name for p in f.iterdir() if p.is_file()] if f.is_dir() else []
+
+    def wipe(self) -> int:
+        import shutil
+        count = sum(1 for p in self.folder.rglob("*") if p.is_file())
+        shutil.rmtree(self.folder, ignore_errors=True)
+        return count
 
 
 # =========================================================================== keyword search (BM25)
@@ -323,6 +348,21 @@ class Library:
             self.collection.delete(where={"doc_id": doc_id})
         self.collection.delete(where={"source": name})
         self._changed()
+
+    def delete_everything(self) -> None:
+        """"Delete my account": every stored file, the search index, local copies and caches."""
+        import shutil
+
+        self.files.wipe()
+        try:
+            _chroma().delete_collection(self.key)
+        except Exception:
+            pass
+        shutil.rmtree(self.folder.parent, ignore_errors=True)         # user_data/<user>/
+        with _lock:
+            for cache in (_kw_cache, _kw_version, _settings_cache):
+                cache.pop(self.key, None)
+            _synced.discard(self.key)
 
     # ------------------------------------------------------------------ restore after restart
     def sync(self, force: bool = False) -> dict | None:

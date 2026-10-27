@@ -29,8 +29,8 @@ import requests
 import streamlit as st
 
 from answer import LLM_MODEL, OLLAMA_URL, SYSTEM_PROMPT, find_citations
-from auth import (current_user, display_name, log_out, login_page, supabase_client, supabase_enabled,
-                  update_name)
+from auth import (current_user, delete_account, display_name, log_out, login_page, supabase_client,
+                  supabase_enabled, update_name)
 from privacy import PROMPT_NOTE as PRIVACY_NOTE
 from privacy import Masker
 from router import CHAT, chat_system_prompt, plan
@@ -41,7 +41,7 @@ from images import load_image
 from knowledge_base import (MAX_DOCUMENTS, MAX_FIGURES_PER_PDF, LimitError, Library, read_attachment)
 from knowledge_base import MAX_FILE_MB as MAX_LIBRARY_FILE_MB
 
-APP_NAME = "My Document Assistant"    # title on the login page, chat page and browser tab
+APP_NAME = "Personal Assistant"    # title on the login page, chat page and browser tab
 TAGLINE = "Upload your own documents and get answers grounded in sources. Private to you."
 GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_VISION_MODEL = "qwen/qwen3.8-27b"   # describes figures in uploaded PDFs
@@ -382,6 +382,35 @@ def feedback_widget(i: int) -> None:
     st.feedback("thumbs", key=key, default=msg.get("feedback"), on_change=_record_feedback, args=(i, key))
 
 
+# =========================================================================== delete account
+@st.dialog("Delete your account?", icon="⚠️")
+def confirm_delete_account() -> None:
+    st.markdown("This permanently deletes:\n"
+                "- your login\n"
+                "- all your documents and the figures read from them\n"
+                "- your conversations, ratings and settings")
+    st.error("This can't be undone.")
+    typed = st.text_input(f"To confirm, type your email: **{user['email']}**")
+    cancel_col, delete_col = st.columns(2)
+    if cancel_col.button("Cancel", use_container_width=True):
+        st.rerun()
+    if delete_col.button("Delete everything", type="primary", use_container_width=True,
+                         disabled=typed.strip().lower() != user["email"].lower()):
+        try:
+            with st.spinner("Deleting your data…"):
+                library.delete_everything()          # files, figures, chats, search index
+        except Exception as e:
+            st.error(f"Couldn't delete your files: {e}. Nothing else was changed; please try again.")
+            return
+        try:
+            delete_account()                         # then the login itself
+        except Exception as e:
+            st.error("Your files were deleted, but the login itself couldn't be removed "
+                     f"({e}). The app owner needs to finish the setup in SETUP_SUPABASE.md, step 2b.")
+            return
+        st.rerun()
+
+
 # =========================================================================== delete confirmation
 @st.dialog("Delete document?", icon="⚠️")
 def confirm_delete(name: str, n_chunks: int) -> None:
@@ -539,6 +568,9 @@ with st.sidebar:
         if st.button("Log out", icon=":material/logout:", type="tertiary"):
             log_out()
             st.rerun()
+        if st.button("Delete account", icon=":material/delete_forever:", type="tertiary",
+                     help="Permanently delete your account and everything in it"):
+            confirm_delete_account()
 
 
 # =========================================================================== evaluation page

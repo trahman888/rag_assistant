@@ -129,6 +129,39 @@ def _supabase_log_in(email: str, password: str) -> dict:
     return _from_supabase(res.user)
 
 
+# --------------------------------------------------------------------------- forgot password / delete account
+def request_password_reset(email: str) -> None:
+    """Supabase emails a one-time code (the "Reset Password" email template must show
+    {{ .Token }}; see SETUP_SUPABASE.md)."""
+    supabase_client().auth.reset_password_for_email(email)
+
+
+def reset_password_with_code(email: str, code: str, new_password: str) -> dict:
+    """Check the emailed code, set the new password, and log the user in."""
+    sb = supabase_client()
+    res = sb.auth.verify_otp({"email": email, "token": code.strip(), "type": "recovery"})
+    if not res.session:
+        raise ValueError("That code didn't work. Check it, or ask for a new one.")
+    sb.auth.update_user({"password": new_password})
+    _remember("sb." + res.session.refresh_token)
+    return _from_supabase(res.user)
+
+
+def delete_account() -> None:
+    """Delete the logged-in user's login. (Their files are deleted first by the app.)
+    Supabase: calls the delete_user() database function from SETUP_SUPABASE.md, which can
+    only ever delete the account of whoever is calling it. No secret key needed."""
+    user = st.session_state["user"]
+    if supabase_enabled():
+        supabase_client().rpc("delete_user").execute()
+    else:
+        users = _load_users()
+        users.pop(user["email"], None)
+        _save_users(users)
+    log_out()
+    st.session_state["_account_deleted"] = True
+
+
 # --------------------------------------------------------------------------- names
 def display_name(user: dict) -> str:
     """The name to show. Accounts created before names existed fall back to the
@@ -269,9 +302,15 @@ def login_page(app_name: str, tagline: str) -> None:
     if not supabase_enabled():
         st.info("Local mode: accounts are stored on this computer only.", icon="💻")
 
+    if st.session_state.pop("_account_deleted", False):
+        st.success("Your account and all your data have been deleted.", icon="🗑️")
+
     _, middle, _ = st.columns([1, 3, 1])
     with middle:
-        log_in_tab, sign_up_tab = st.tabs(["Log in", "Create account"])
+        log_in_tab, sign_up_tab, forgot_tab = st.tabs(["Log in", "Create account", "Forgot password"])
+
+        with forgot_tab:
+            _forgot_password_form()
 
         with log_in_tab, st.form("login"):
             email = st.text_input("Email").strip().lower()
@@ -307,10 +346,63 @@ def login_page(app_name: str, tagline: str) -> None:
                         st.error(_friendly(e))
 
 
+def _forgot_password_form() -> None:
+    """Step 1: email me a code.  Step 2: code + new password."""
+    if not supabase_enabled():
+        st.info("Local mode has no email, so passwords can't be reset here. "
+                "Create a new account, or delete user_data/users.json to start over.")
+        return
+    sent_to = st.session_state.get("_reset_email")
+    if not sent_to:
+        with st.form("forgot"):
+            email = st.text_input("Your account's email", key="fp_email").strip().lower()
+            if st.form_submit_button("Email me a reset code", use_container_width=True):
+                if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                    st.error("Please enter a valid email address.")
+                else:
+                    try:
+                        request_password_reset(email)
+                        st.session_state["_reset_email"] = email
+                        st.rerun()
+                    except Exception as e:
+                        st.error(_friendly(e))
+        return
+
+    st.caption(f"If an account exists for **{sent_to}**, we've emailed it a reset code. "
+               "It can take a minute; check your spam folder too.")
+    with st.form("reset"):
+        code = st.text_input("Code from the email", key="fp_code", max_chars=10)
+        new_pw = st.text_input("New password (6+ characters)", type="password", key="fp_pw")
+        confirm = st.text_input("Repeat new password", type="password", key="fp_pw2")
+        if st.form_submit_button("Set new password and log in", type="primary", use_container_width=True):
+            problem = ((None if code.strip().isdigit() else "Enter the number from the email.")
+                       or _valid(sent_to, new_pw)
+                       or (None if new_pw == confirm else "Passwords don't match."))
+            if problem:
+                st.error(problem)
+            else:
+                try:
+                    user = reset_password_with_code(sent_to, code, new_pw)
+                    st.session_state.pop("_reset_email", None)
+                    _logged_in(user)
+                    st.rerun()
+                except Exception as e:
+                    st.error(_friendly(e))
+    if st.button("Use a different email / send a new code", type="tertiary"):
+        st.session_state.pop("_reset_email", None)
+        st.rerun()
+
+
 def _friendly(e: Exception) -> str:
     msg = getattr(e, "message", None) or str(e)
     if "Invalid login credentials" in msg:
         return "Wrong email or password."
     if "Email not confirmed" in msg:
         return "Please confirm your email first (check your inbox), then log in."
+    if "expired" in msg.lower() or "invalid" in msg.lower() and "token" in msg.lower():
+        return "That code is wrong or has expired. Ask for a new one."
+    if "rate limit" in msg.lower() or "429" in msg:
+        return "Too many emails were sent recently. Please wait a few minutes and try again."
+    if "should be different" in msg.lower():
+        return "Choose a password different from your old one."
     return msg
