@@ -33,7 +33,7 @@ Everything runs on free, open-source models and free hosting tiers.
 
 **Privacy and accounts**
 - Email/password accounts (Supabase Auth). Login and the current conversation survive a page refresh.
-- **Forgot password** with a one-time code sent by email.
+- **Forgot password**: the reset email link opens the app on a "choose a new password" form (PKCE flow, so it works with Streamlit and the default Supabase email).
 - **Delete my account**: removes the user's files, figures, chats, search index and login in one step. A security-definer database function lets users delete only their own account, so the app never needs Supabase's secret key.
 - **PII masking:** emails, phone numbers, card numbers, SSN/SIN and IP addresses are replaced with placeholders like `<EMAIL_1>` before any text reaches the LLM, and restored in the answer the user sees.
 - Storage access is enforced **by the database itself** (row-level security), not only by the app's code.

@@ -130,21 +130,110 @@ def _supabase_log_in(email: str, password: str) -> dict:
 
 
 # --------------------------------------------------------------------------- forgot password / delete account
+# How "Forgot password" works with Supabase's DEFAULT reset email (its template can't be edited
+# on new free projects):
+#   1. We ask Supabase for a reset email in "PKCE" mode: we make a random secret (the verifier),
+#      send Supabase only its fingerprint (the challenge), and keep the secret on this server.
+#   2. The email's link then opens the app as  https://your-app/?code=…  (a normal query
+#      parameter Streamlit can read; the older kind of link used "#…", which Streamlit can't).
+#   3. The user picks a new password; we trade the code + our secret for a login session and
+#      save the password. Without the secret kept here, the code alone is useless.
+RESET_CODE_PARAM = "code"
+RESET_ID_PARAM = "reset_id"
+RESET_LINK_HOURS = 1
+_pending_resets: dict[str, dict] = {}     # reset_id -> {"verifier", "email", "time"}  (server memory)
+
+
+def _app_url() -> str:
+    """This app's public address, for the link in the email (APP_URL secret, else the current page)."""
+    url = _secret("APP_URL")
+    if not url:
+        try:
+            url = st.context.url
+        except Exception:
+            url = ""
+    return (url or "").split("?")[0].split("#")[0].rstrip("/")
+
+
 def request_password_reset(email: str) -> None:
-    """Supabase emails a one-time code (the "Reset Password" email template must show
-    {{ .Token }}; see SETUP_SUPABASE.md)."""
-    supabase_client().auth.reset_password_for_email(email)
+    """Ask Supabase to email a reset link that comes back to this app with ?code=…"""
+    import requests
+    from urllib.parse import urlparse
+
+    from supabase_auth.helpers import generate_pkce_challenge, generate_pkce_verifier
+
+    now = time.time()
+    for rid in [r for r, v in _pending_resets.items() if now - v["time"] > RESET_LINK_HOURS * 3600]:
+        _pending_resets.pop(rid, None)
+    verifier = generate_pkce_verifier()
+    reset_id = secrets.token_urlsafe(12)
+    _pending_resets[reset_id] = {"verifier": verifier, "email": email, "time": now}
+
+    u = urlparse(_secret("SUPABASE_URL").strip())
+    key = _secret("SUPABASE_KEY").strip()
+    params = {}
+    if _app_url():
+        params["redirect_to"] = f"{_app_url()}/?{RESET_ID_PARAM}={reset_id}"
+    r = requests.post(f"{u.scheme}://{u.netloc}/auth/v1/recover", params=params, timeout=20,
+                      headers={"apikey": key, "Authorization": f"Bearer {key}"},
+                      json={"email": email, "code_challenge": generate_pkce_challenge(verifier),
+                            "code_challenge_method": "s256"})
+    if r.status_code >= 400:
+        try:
+            msg = r.json().get("msg") or r.json().get("message") or r.text
+        except Exception:
+            msg = r.text
+        raise ValueError(msg)
 
 
-def reset_password_with_code(email: str, code: str, new_password: str) -> dict:
-    """Check the emailed code, set the new password, and log the user in."""
+def reset_password_with_link(code: str, reset_id: str | None, new_password: str) -> dict:
+    """The email's link opened the app with ?code=…: check it, save the new password, log in."""
     sb = supabase_client()
-    res = sb.auth.verify_otp({"email": email, "token": code.strip(), "type": "recovery"})
-    if not res.session:
-        raise ValueError("That code didn't work. Check it, or ask for a new one.")
-    sb.auth.update_user({"password": new_password})
-    _remember("sb." + res.session.refresh_token)
-    return _from_supabase(res.user)
+    if reset_id and reset_id in _pending_resets:
+        candidates = [reset_id]
+    else:   # Supabase sent the link to the plain Site URL (no reset_id): try recent requests, newest first
+        candidates = sorted(_pending_resets, key=lambda r: -_pending_resets[r]["time"])[:10]
+    for rid in candidates:
+        try:
+            res = sb.auth.exchange_code_for_session({"auth_code": code, "code_verifier": _pending_resets[rid]["verifier"]})
+        except Exception:
+            continue
+        if res.session:
+            sb.auth.update_user({"password": new_password})
+            _pending_resets.pop(rid, None)
+            _remember("sb." + res.session.refresh_token)
+            return _from_supabase(res.user)
+    raise ValueError("This reset link has expired or was already used. Use Forgot password to get a new one.")
+
+
+def _reset_link_form(code: str) -> None:
+    """Shown instead of the login tabs when the app is opened from the reset email's link."""
+    st.subheader("Choose a new password")
+    with st.form("reset_link"):
+        new_pw = st.text_input("New password (6+ characters)", type="password", key="rl_pw")
+        confirm = st.text_input("Repeat new password", type="password", key="rl_pw2")
+        if st.form_submit_button("Set new password and log in", type="primary", use_container_width=True):
+            problem = (None if len(new_pw) >= 6 else "Password must be at least 6 characters.") \
+                or (None if new_pw == confirm else "Passwords don't match.")
+            if problem:
+                st.error(problem)
+            else:
+                try:
+                    user = reset_password_with_link(code, st.query_params.get(RESET_ID_PARAM), new_pw)
+                    _clear_reset_params()
+                    _logged_in(user)
+                    st.rerun()
+                except Exception as e:
+                    st.error(_friendly(e))
+    if st.button("Back to log in", type="tertiary"):
+        _clear_reset_params()
+        st.rerun()
+
+
+def _clear_reset_params() -> None:
+    for name in (RESET_CODE_PARAM, RESET_ID_PARAM):
+        if name in st.query_params:
+            del st.query_params[name]
 
 
 def delete_account() -> None:
@@ -306,6 +395,11 @@ def login_page(app_name: str, tagline: str) -> None:
         st.success("Your account and all your data have been deleted.", icon="🗑️")
 
     _, middle, _ = st.columns([1, 3, 1])
+    reset_code = st.query_params.get(RESET_CODE_PARAM) if supabase_enabled() else None
+    if reset_code:                                   # opened from the "reset password" email link
+        with middle:
+            _reset_link_form(reset_code)
+        return
     with middle:
         log_in_tab, sign_up_tab, forgot_tab = st.tabs(["Log in", "Create account", "Forgot password"])
 
@@ -356,7 +450,7 @@ def _forgot_password_form() -> None:
     if not sent_to:
         with st.form("forgot"):
             email = st.text_input("Your account's email", key="fp_email").strip().lower()
-            if st.form_submit_button("Email me a reset code", use_container_width=True):
+            if st.form_submit_button("Email me a reset link", use_container_width=True):
                 if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
                     st.error("Please enter a valid email address.")
                 else:
@@ -367,28 +461,10 @@ def _forgot_password_form() -> None:
                     except Exception as e:
                         st.error(_friendly(e))
         return
-
-    st.caption(f"If an account exists for **{sent_to}**, we've emailed it a reset code. "
-               "It can take a minute; check your spam folder too.")
-    with st.form("reset"):
-        code = st.text_input("Code from the email", key="fp_code", max_chars=10)
-        new_pw = st.text_input("New password (6+ characters)", type="password", key="fp_pw")
-        confirm = st.text_input("Repeat new password", type="password", key="fp_pw2")
-        if st.form_submit_button("Set new password and log in", type="primary", use_container_width=True):
-            problem = ((None if code.strip().isdigit() else "Enter the number from the email.")
-                       or _valid(sent_to, new_pw)
-                       or (None if new_pw == confirm else "Passwords don't match."))
-            if problem:
-                st.error(problem)
-            else:
-                try:
-                    user = reset_password_with_code(sent_to, code, new_pw)
-                    st.session_state.pop("_reset_email", None)
-                    _logged_in(user)
-                    st.rerun()
-                except Exception as e:
-                    st.error(_friendly(e))
-    if st.button("Use a different email / send a new code", type="tertiary"):
+    st.success(f"If an account exists for **{sent_to}**, we've emailed it a password reset link. "
+               "Open the email and click **Reset password**: this app opens and asks for your new password. "
+               f"The link works for {RESET_LINK_HOURS} hour; check your spam folder too.", icon="📧")
+    if st.button("Use a different email / send a new link", type="tertiary"):
         st.session_state.pop("_reset_email", None)
         st.rerun()
 
@@ -399,6 +475,11 @@ def _friendly(e: Exception) -> str:
         return "Wrong email or password."
     if "Email not confirmed" in msg:
         return "Please confirm your email first (check your inbox), then log in."
+    if "not authorized" in msg.lower():
+        return ("Supabase's built-in email can only send to the project owner's team. "
+                "The app owner needs to set up custom SMTP (see SETUP_SUPABASE.md).")
+    if "link" in msg.lower() and ("expired" in msg.lower() or "invalid" in msg.lower()):
+        return "This reset link has expired or was already used. Use Forgot password to get a new one."
     if "expired" in msg.lower() or "invalid" in msg.lower() and "token" in msg.lower():
         return "That code is wrong or has expired. Ask for a new one."
     if "rate limit" in msg.lower() or "429" in msg:
