@@ -400,57 +400,90 @@ def login_page(app_name: str, tagline: str) -> None:
         with middle:
             _reset_link_form(reset_code)
         return
-    with middle:
-        log_in_tab, sign_up_tab, forgot_tab = st.tabs(["Log in", "Create account", "Forgot password"])
+    view = st.session_state.get("_auth_view", "login")     # "login" | "signup" | "forgot"
+    with middle, st.container(border=True):
+        notice = st.session_state.pop("_auth_notice", None)
+        if notice:
+            st.success(notice)
+        {"login": _log_in_view, "signup": _sign_up_view, "forgot": _forgot_view}[view]()
 
-        with forgot_tab:
-            _forgot_password_form()
 
-        with log_in_tab, st.form("login"):
-            email = st.text_input("Email").strip().lower()
-            password = st.text_input("Password", type="password")
-            if st.form_submit_button("Log in", type="primary", use_container_width=True):
+def _go(view: str) -> None:
+    """Switch between the log-in, create-account and forgot-password screens (same card)."""
+    st.session_state["_auth_view"] = view
+    st.session_state.pop("_reset_email", None)
+
+
+def _link(label: str, view: str, key: str) -> None:
+    st.button(label, type="tertiary", key=key, on_click=_go, args=(view,))
+
+
+def _log_in_view() -> None:
+    st.subheader("Log in")
+    with st.form("login", border=False):
+        email = st.text_input("Email", value=st.session_state.get("_auth_email", "")).strip().lower()
+        password = st.text_input("Password", type="password")
+        if st.form_submit_button("Log in", type="primary", use_container_width=True):
+            st.session_state["_auth_email"] = email
+            try:
+                user = (_supabase_log_in if supabase_enabled() else _local_log_in)(email, password)
+                _logged_in(user)
+                st.rerun()
+            except Exception as e:
+                st.error(_friendly(e))
+    left, right = st.columns(2, vertical_alignment="center")
+    with left:
+        _link("Forgot password?", "forgot", "to_forgot")
+    with right, st.container(horizontal_alignment="right"):
+        _link("Create an account", "signup", "to_signup")
+
+
+def _sign_up_view() -> None:
+    st.subheader("Create your account")
+    with st.form("signup", border=False):
+        name = re.sub(r"\s+", " ", st.text_input("Full name", key="su_name", max_chars=60)).strip()
+        email = st.text_input("Email", key="su_email").strip().lower()
+        password = st.text_input("Password (6+ characters)", type="password", key="su_pw")
+        confirm = st.text_input("Repeat password", type="password", key="su_pw2")
+        if st.form_submit_button("Create account", type="primary", use_container_width=True):
+            problem = (("Please enter your name." if not name else None)
+                       or _valid(email, password)
+                       or (None if password == confirm else "Passwords don't match."))
+            if problem:
+                st.error(problem)
+            else:
                 try:
-                    user = (_supabase_log_in if supabase_enabled() else _local_log_in)(email, password)
-                    _logged_in(user)
+                    user = (_supabase_sign_up if supabase_enabled() else _local_sign_up)(email, password, name)
+                    if user is None:                      # Supabase: confirm the email first
+                        st.session_state["_auth_email"] = email
+                        st.session_state["_auth_notice"] = "Account created. Check your email to confirm it, then log in."
+                        _go("login")
+                    else:
+                        _logged_in(user)
                     st.rerun()
                 except Exception as e:
                     st.error(_friendly(e))
+    _link("Already have an account? Log in", "login", "to_login_from_signup")
 
-        with sign_up_tab, st.form("signup"):
-            name = re.sub(r"\s+", " ", st.text_input("Full name", key="su_name", max_chars=60)).strip()
-            email = st.text_input("Email", key="su_email").strip().lower()
-            password = st.text_input("Password (6+ characters)", type="password", key="su_pw")
-            confirm = st.text_input("Repeat password", type="password", key="su_pw2")
-            if st.form_submit_button("Create account", use_container_width=True):
-                problem = (("Please enter your name." if not name else None)
-                           or _valid(email, password)
-                           or (None if password == confirm else "Passwords don't match."))
-                if problem:
-                    st.error(problem)
-                else:
-                    try:
-                        user = (_supabase_sign_up if supabase_enabled() else _local_sign_up)(email, password, name)
-                        if user is None:
-                            st.success("Account created. Check your email to confirm it, then log in.")
-                        else:
-                            _logged_in(user)
-                            st.rerun()
-                    except Exception as e:
-                        st.error(_friendly(e))
+
+def _forgot_view() -> None:
+    st.subheader("Reset your password")
+    _forgot_password_form()
+    _link("Back to log in", "login", "to_login_from_forgot")
 
 
 def _forgot_password_form() -> None:
-    """Step 1: email me a code.  Step 2: code + new password."""
+    """Email me a reset link (the link opens the app on _reset_link_form)."""
     if not supabase_enabled():
         st.info("Local mode has no email, so passwords can't be reset here. "
                 "Create a new account, or delete user_data/users.json to start over.")
         return
     sent_to = st.session_state.get("_reset_email")
     if not sent_to:
-        with st.form("forgot"):
-            email = st.text_input("Your account's email", key="fp_email").strip().lower()
-            if st.form_submit_button("Email me a reset link", use_container_width=True):
+        st.caption("Enter your account's email and we'll send you a link to choose a new password.")
+        with st.form("forgot", border=False):
+            email = st.text_input("Email", value=st.session_state.get("_auth_email", ""), key="fp_email").strip().lower()
+            if st.form_submit_button("Email me a reset link", type="primary", use_container_width=True):
                 if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
                     st.error("Please enter a valid email address.")
                 else:
